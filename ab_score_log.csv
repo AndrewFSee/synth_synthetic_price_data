@@ -1,0 +1,46 @@
+timestamp_utc,date,project,submission_id,score_recent,score_steady,score_anchor,anchor_1h,anchor_24h,notes
+2026-02-14T01:47:16.697849+00:00,2026-02-14,invisible-fox,11,,,,,,Post GARCH deployment
+2026-02-14T01:47:18.795049+00:00,2026-02-14,realistic-gazelle,12,,,,,,Post mixture deployment
+2026-02-14T21:36:17.170723+00:00,2026-02-14,invisible-fox,11,0.780000,0.870000,0.830000,,,daily snapshot
+2026-02-14T21:37:21.996713+00:00,2026-02-14,realistic-gazelle,12,0.780000,0.870000,0.830000,,,daily snapshot
+2026-02-15T17:55:05.801281+00:00,2026-02-15,invisible-fox,11,0.850000,0.845000,0.902000,,,daily snapshot
+2026-02-15T17:56:04.337354+00:00,2026-02-15,realistic-gazelle,12,0.866000,0.849000,0.904000,,,daily snapshot
+2026-02-16T17:54:30.049383+00:00,2026-02-16,invisible-fox,11,0.947000,0.856000,0.914000,,,daily snapshot
+2026-02-16T17:55:59.169735+00:00,2026-02-16,realistic-gazelle,12,0.928000,0.854000,0.913000,,,daily snapshot
+2026-02-17T17:46:05.814452+00:00,2026-02-17,realistic-gazelle,12,0.894000,0.896000,0.901000,,,daily snapshot
+2026-02-17T17:46:57.442635+00:00,2026-02-17,invisible-fox,11,0.905000,0.902000,0.903000,,,daily snapshot
+2026-02-18T21:41:28.667045+00:00,2026-02-18,realistic-gazelle,12,0.800000,0.868000,0.871000,,,daily snapshot
+2026-02-18T21:42:43.197940+00:00,2026-02-18,invisible-fox,11,0.772000,0.866000,0.869000,,,daily snapshot
+2026-02-18T23:00:31.547864+00:00,2026-02-18,invisible-fox,12,,,,,,robust garch tail hotfix deployed
+2026-02-18T23:00:42.606490+00:00,2026-02-18,realistic-gazelle,14,,,,,,regime-mixture stabilization deployed
+2026-02-19T03:50:26.748894+00:00,2026-02-19,realistic-gazelle,15,,,,,,hybrid pretrained quantiles deployed
+2026-02-19T04:10:36.252178+00:00,2026-02-19,invisible-fox,13,,,,,,hybrid pretrained quantiles deployed
+2026-02-19T14:08:58.615073+00:00,2026-02-19,invisible-fox,14,,,,,,"v14: regex fix, student-t tails, component limit fix, loc=0, asset defaults"
+2026-02-19T14:08:59.325542+00:00,2026-02-19,realistic-gazelle,16,,,,,,"v16: regex fix, laplace tails, component limit fix, loc=0, asset defaults"
+2026-02-19T21:45:16.349818+00:00,2026-02-19,invisible-fox,11,0.782000,0.810000,0.844000,,,daily snapshot
+2026-02-19T21:46:35.515437+00:00,2026-02-19,realistic-gazelle,12,0.642000,0.773000,0.827000,,,daily snapshot
+2026-02-20T16:21:22.028483+00:00,2026-02-20,invisible-fox,14,0.930000,,,,,v14 rebound - GARCH+Student-t
+2026-02-20T16:21:22.523779+00:00,2026-02-20,realistic-gazelle,16,0.570000,,,,,v16 dropping - Laplace issue?
+2026-02-20T16:31:30.792113+00:00,2026-02-20,realistic-gazelle,17,,,,,,v17: GARCH evolution + wider Laplace 1.5x
+2026-02-22T03:07:38.625951+00:00,2026-02-22,invisible-fox,14,0.884000,0.844000,0.862000,,,daily snapshot
+2026-02-22T03:08:31.908675+00:00,2026-02-22,realistic-gazelle,17,0.868000,0.601000,0.774000,,,daily snapshot
+2026-02-23T18:18:25.873785+00:00,2026-02-23,realistic-gazelle,17,0.954000,0.874000,0.779000,,,daily snapshot
+2026-02-23T18:19:20.207041+00:00,2026-02-23,invisible-fox,14,0.949000,0.861000,0.849000,,,daily snapshot
+2026-02-24T19:22:58.089448+00:00,2026-02-24,invisible-fox,14,0.928000,0.900000,0.854000,,,daily snapshot
+2026-02-24T19:24:26.142503+00:00,2026-02-24,realistic-gazelle,17,0.931000,0.909000,0.786000,,,daily snapshot
+2026-02-25T17:40:59.167648+00:00,2026-02-25,invisible-fox,14,0.906000,0.927000,0.872000,,,daily snapshot
+2026-02-25T17:41:37.425319+00:00,2026-02-25,realistic-gazelle,17,0.912000,0.932000,0.802000,,,daily snapshot
+2026-02-26T16:41:33.544576+00:00,2026-02-26,realistic-gazelle,17,0.850000,0.898000,0.831000,,,daily snapshot
+2026-02-26T16:42:28.860528+00:00,2026-02-26,invisible-fox,14,0.845000,0.894000,0.883000,,,daily snapshot
+2026-02-26T17:30:26.022948+00:00,2026-02-26,invisible-fox,15,,,,,,v15: regime-adaptive GARCH deployed
+2026-02-26T17:30:27.149506+00:00,2026-02-26,realistic-gazelle,19,,,,,,v19: regime-adaptive multi-scale deployed
+2026-02-27T17:15:36.968487+00:00,2026-02-27,invisible-fox,15,0.945000,0.899000,0.887000,,,daily snapshot
+2026-02-28T14:15:28.604864+00:00,2026-02-28,realistic-gazelle,20,,,,,,"v20: consistency-tuned weights - tail 30pct, pretrained 20pct"
+2026-03-01T17:17:45.927086+00:00,2026-03-01,realistic-gazelle,20,0.913000,0.926000,0.918000,,,daily snapshot
+2026-03-01T17:18:47.958042+00:00,2026-03-01,invisible-fox,15,0.915000,0.925000,0.915000,,,daily snapshot
+2026-03-02T17:34:34.160510+00:00,2026-03-02,invisible-fox,15,0.938000,0.923000,0.914000,,,daily snapshot
+2026-03-02T17:36:30.427828+00:00,2026-03-02,realistic-gazelle,20,0.940000,0.923000,0.916000,,,daily snapshot
+2026-03-03T16:27:59.258266+00:00,2026-03-03,realistic-gazelle,20,0.938000,0.930000,0.917000,,,daily snapshot
+2026-03-03T16:28:43.626374+00:00,2026-03-03,invisible-fox,15,0.938000,0.930000,0.915000,,,daily snapshot
+2026-03-04T16:45:13.021144+00:00,2026-03-04,invisible-fox,16,0.921000,0.932000,0.916000,0.886000,0.930000,daily snapshot
+2026-03-04T16:46:40.873450+00:00,2026-03-04,realistic-gazelle,21,0.921000,0.932000,0.918000,0.886000,0.932000,daily snapshot
