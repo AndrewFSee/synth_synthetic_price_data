@@ -226,11 +226,11 @@ class MyTracker(TrackerBase):
             return self._default_predictions(asset, horizon, step)
 
         # ── Horizon-aware lookback ──
-        # 1h profile: shorter lookback, faster reaction
+        # 1h profile: shorter lookback, slightly faster reaction
         is_short = (horizon <= 3600)
-        lookback = 96 if is_short else 300        # 8h vs 25h (broader than fox)
-        ewma_lam = 0.93 if is_short else 0.97     # faster vs normal
-        garch_win = 36 if is_short else 72         # 3h vs 6h
+        lookback = 144 if is_short else 300        # 12h vs 25h (broader than fox)
+        ewma_lam = 0.95 if is_short else 0.97     # slightly faster
+        garch_win = 48 if is_short else 72         # 4h vs 6h
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
@@ -259,14 +259,14 @@ class MyTracker(TrackerBase):
         pre_base = self._pretrained_base(recent)
 
         # ── Dynamic weights ──
-        # 1h: less pretrained (5-min features unreliable), more Laplace tail
+        # 1h: slightly less pretrained, keep Laplace close to 24h
         if is_short:
             if pre_base:
-                tail_w = 0.35 + 0.10 * ri
-                pre_w  = 0.10 - 0.07 * ri
+                tail_w = 0.25 + 0.10 * ri
+                pre_w  = 0.18 - 0.10 * ri
                 core_w = 1.0 - tail_w - pre_w
             else:
-                tail_w = 0.45 + 0.05 * ri
+                tail_w = 0.38 + 0.07 * ri
                 core_w = 1.0 - tail_w
         else:
             if pre_base:
@@ -303,8 +303,8 @@ class MyTracker(TrackerBase):
             sigma = blend_fast * garch_sig + (1 - blend_fast) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
-            # Laplace scale: wider for short horizon (noisier at 1-min)
-            lap_mult = (1.8 if is_short else 1.5) + 0.8 * ri
+            # Laplace scale: keep same multiplier for both horizons
+            lap_mult = 1.5 + 0.8 * ri
             lap_scale = sigma * lap_mult
 
             if pre_base:

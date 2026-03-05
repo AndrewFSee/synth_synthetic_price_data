@@ -230,11 +230,11 @@ class MyTracker(TrackerBase):
             return self._default_predictions(asset, horizon, step)
 
         # ── Horizon-aware lookback ──
-        # 1h profile: shorter lookback, faster reaction
+        # 1h profile: shorter lookback, slightly faster reaction
         is_short = (horizon <= 3600)
-        lookback = 72 if is_short else 300       # 6h vs 25h
-        ewma_lam = 0.90 if is_short else 0.94    # faster vs normal
-        garch_win = 24 if is_short else 48        # 2h vs 4h
+        lookback = 120 if is_short else 300      # 10h vs 25h
+        ewma_lam = 0.92 if is_short else 0.94    # slightly faster
+        garch_win = 36 if is_short else 48        # 3h vs 4h
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
@@ -261,14 +261,14 @@ class MyTracker(TrackerBase):
         pre_base = self._pretrained_base(recent)
 
         # ── Dynamic component weights ──
-        # 1h: less pretrained (features are 5-min based), more tail
+        # 1h: slightly less pretrained, keep tail close to 24h
         if is_short:
             if pre_base:
-                tail_w = 0.30 + 0.10 * ri
-                pre_w  = 0.15 - 0.10 * ri
+                tail_w = 0.22 + 0.12 * ri
+                pre_w  = 0.25 - 0.15 * ri
                 core_w = 1.0 - tail_w - pre_w
             else:
-                tail_w = 0.40 + 0.10 * ri
+                tail_w = 0.35 + 0.10 * ri
                 core_w = 1.0 - tail_w
         else:
             if pre_base:
@@ -280,8 +280,8 @@ class MyTracker(TrackerBase):
                 core_w = 1.0 - tail_w
 
         # Student-t df: lower = heavier tails during regime changes
-        # 1h: start heavier (df=4) since short horizons are noisier
-        df = max(3.0, (4.0 if is_short else 5.0) - 2.0 * ri)
+        # 1h: use same df as 24h (over-wide tails hurt CRPS)
+        df = max(3.0, 5.0 - 2.0 * ri)
 
         scale_factor = step / resolution
         sqrt_sf = math.sqrt(max(scale_factor, 1e-6))
