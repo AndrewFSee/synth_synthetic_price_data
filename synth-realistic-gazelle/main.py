@@ -225,12 +225,10 @@ class MyTracker(TrackerBase):
         if len(returns) < 10:
             return self._default_predictions(asset, horizon, step)
 
-        # ── Horizon-aware lookback ──
-        # 1h profile: shorter lookback, slightly faster reaction
-        is_short = (horizon <= 3600)
-        lookback = 144 if is_short else 300        # 12h vs 25h (broader than fox)
-        ewma_lam = 0.95 if is_short else 0.97     # slightly faster
-        garch_win = 48 if is_short else 72         # 4h vs 6h
+        # ── Lookback & GARCH parameters (unified across horizons) ──
+        lookback = 300         # 25h (same for all horizons)
+        ewma_lam = 0.97        # smooth EWMA
+        garch_win = 72         # 6h
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
@@ -258,24 +256,14 @@ class MyTracker(TrackerBase):
         # Pretrained: compute ONCE at base resolution
         pre_base = self._pretrained_base(recent)
 
-        # ── Dynamic weights ──
-        # 1h: slightly less pretrained, keep Laplace close to 24h
-        if is_short:
-            if pre_base:
-                tail_w = 0.25 + 0.10 * ri
-                pre_w  = 0.18 - 0.10 * ri
-                core_w = 1.0 - tail_w - pre_w
-            else:
-                tail_w = 0.38 + 0.07 * ri
-                core_w = 1.0 - tail_w
+        # ── Dynamic weights (unified across horizons) ──
+        if pre_base:
+            tail_w = 0.30 + 0.10 * ri
+            pre_w  = 0.20 - 0.15 * ri
+            core_w = 1.0 - tail_w - pre_w
         else:
-            if pre_base:
-                tail_w = 0.30 + 0.10 * ri
-                pre_w  = 0.20 - 0.15 * ri
-                core_w = 1.0 - tail_w - pre_w
-            else:
-                tail_w = 0.40 + 0.10 * ri
-                core_w = 1.0 - tail_w
+            tail_w = 0.40 + 0.10 * ri
+            core_w = 1.0 - tail_w
 
         scale_factor = step / resolution
         sqrt_sf = math.sqrt(max(scale_factor, 1e-6))

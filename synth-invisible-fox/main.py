@@ -229,12 +229,10 @@ class MyTracker(TrackerBase):
         if len(returns) < 10:
             return self._default_predictions(asset, horizon, step)
 
-        # ── Horizon-aware lookback ──
-        # 1h profile: shorter lookback, slightly faster reaction
-        is_short = (horizon <= 3600)
-        lookback = 120 if is_short else 300      # 10h vs 25h
-        ewma_lam = 0.92 if is_short else 0.94    # slightly faster
-        garch_win = 36 if is_short else 48        # 3h vs 4h
+        # ── Lookback & GARCH parameters (unified across horizons) ──
+        lookback = 300       # 25h
+        ewma_lam = 0.94
+        garch_win = 48       # 4h
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
@@ -260,27 +258,16 @@ class MyTracker(TrackerBase):
         # Pretrained: compute ONCE at base resolution
         pre_base = self._pretrained_base(recent)
 
-        # ── Dynamic component weights ──
-        # 1h: slightly less pretrained, keep tail close to 24h
-        if is_short:
-            if pre_base:
-                tail_w = 0.22 + 0.12 * ri
-                pre_w  = 0.25 - 0.15 * ri
-                core_w = 1.0 - tail_w - pre_w
-            else:
-                tail_w = 0.35 + 0.10 * ri
-                core_w = 1.0 - tail_w
+        # ── Dynamic component weights (unified across horizons) ──
+        if pre_base:
+            tail_w = 0.20 + 0.15 * ri
+            pre_w  = 0.30 - 0.21 * ri
+            core_w = 1.0 - tail_w - pre_w
         else:
-            if pre_base:
-                tail_w = 0.20 + 0.15 * ri
-                pre_w  = 0.30 - 0.21 * ri
-                core_w = 1.0 - tail_w - pre_w
-            else:
-                tail_w = 0.35 + 0.10 * ri
-                core_w = 1.0 - tail_w
+            tail_w = 0.35 + 0.10 * ri
+            core_w = 1.0 - tail_w
 
         # Student-t df: lower = heavier tails during regime changes
-        # 1h: use same df as 24h (over-wide tails hurt CRPS)
         df = max(3.0, 5.0 - 2.0 * ri)
 
         scale_factor = step / resolution
