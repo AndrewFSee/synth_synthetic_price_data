@@ -24,6 +24,18 @@ _DEFAULT_SIGMA_5M: Dict[str, float] = {
     "SPYX": 0.7, "NVDAX": 0.5, "TSLAX": 1.3, "AAPLX": 0.45, "GOOGLX": 0.7,
 }
 
+# Asset-specific tuning: adjust density width for worst-performing assets.
+# ri_damp:      Dampen regime intensity (SOL's vol-of-vol inflates ri too much)
+# t_scale_base: Base multiplier for Student-t scale (default 1.8)
+# clamp_max:    Max sigma as fraction of price (default 0.015)
+# tail_adj:     Additive adjustment to tail weight (default 0.0)
+_ASSET_TUNING: Dict[str, Dict[str, float]] = {
+    "SOL":   {"ri_damp": 0.6, "t_scale_base": 1.4, "clamp_max": 0.010, "tail_adj": -0.06},
+    "BTC":   {"ri_damp": 0.8, "t_scale_base": 1.6, "clamp_max": 0.012, "tail_adj": -0.03},
+    "SPYX":  {"ri_damp": 0.8, "t_scale_base": 1.6, "clamp_max": 0.012, "tail_adj": -0.03},
+    "ETH":   {"ri_damp": 0.9, "t_scale_base": 1.7, "clamp_max": 0.013, "tail_adj": -0.02},
+}
+
 
 class MyTracker(TrackerBase):
     """GARCH + Student-t tracker.  ≤ 3 components always."""
@@ -237,8 +249,16 @@ class MyTracker(TrackerBase):
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
 
+        # ── Asset-specific tuning ──
+        tuning = _ASSET_TUNING.get(asset, {})
+        ri_damp = tuning.get("ri_damp", 1.0)
+        t_scale_base = tuning.get("t_scale_base", 1.8)
+        clamp_max_pct = tuning.get("clamp_max", 0.015)
+        tail_adj = tuning.get("tail_adj", 0.0)
+
         # ── Regime change detection ──
-        fast_std, slow_std, ri = self._vol_regime(recent)
+        fast_std, slow_std, ri_raw = self._vol_regime(recent)
+        ri = ri_raw * ri_damp   # dampen for high-vol-of-vol assets
         blend_fast = 0.3 + 0.5 * ri
         sigma_base = blend_fast * fast_std + (1 - blend_fast) * slow_std
 
@@ -248,23 +268,23 @@ class MyTracker(TrackerBase):
         current_var = self._ewma_var(gw, lam=ewma_lam)
         last_shock = float((recent[-1] - np.mean(recent[-12:])) ** 2)
 
-        # Clamps
+        # Clamps (asset-specific max)
         if last_price > 0:
             min_scale = 0.0003 * last_price
-            max_scale = 0.015 * last_price * (1 + 0.5 * ri)
+            max_scale = clamp_max_pct * last_price * (1 + 0.5 * ri)
         else:
             min_scale, max_scale = 1e-6, sigma_base * 8.0
 
         # Pretrained: compute ONCE at base resolution
         pre_base = self._pretrained_base(recent)
 
-        # ── Dynamic component weights (unified across horizons) ──
+        # ── Dynamic component weights (with asset-specific tail adjustment) ──
         if pre_base:
-            tail_w = 0.20 + 0.15 * ri
+            tail_w = max(0.08, 0.20 + 0.15 * ri + tail_adj)
             pre_w  = 0.30 - 0.21 * ri
             core_w = 1.0 - tail_w - pre_w
         else:
-            tail_w = 0.35 + 0.10 * ri
+            tail_w = max(0.15, 0.35 + 0.10 * ri + tail_adj)
             core_w = 1.0 - tail_w
 
         # Student-t df: lower = heavier tails during regime changes
@@ -298,7 +318,7 @@ class MyTracker(TrackerBase):
             sigma = blend_fast * garch_sig + (1 - blend_fast) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
-            t_scale = sigma * (1.8 + 0.5 * ri)
+            t_scale = sigma * (t_scale_base + 0.5 * ri)
 
             if pre_base:
                 pre_loc = pre_base["loc"] * scale_factor

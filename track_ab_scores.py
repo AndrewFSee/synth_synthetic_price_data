@@ -12,7 +12,7 @@ Daily workflow
 Copy/paste commands (run from workspace root)
 
 Add invisible-fox snapshot:
-python track_ab_scores.py add --project invisible-fox --submission-id 18 --score-recent 0.845 --score-steady 0.923 --score-anchor 0.731 --anchor-1h 0.800 --anchor-24h 0.750 --notes "daily snapshot"
+python track_ab_scores.py add --project invisible-fox --submission-id 19 --score-recent 0.845 --score-steady 0.923 --score-anchor 0.731 --anchor-1h 0.800 --anchor-24h 0.750 --notes "daily snapshot"
 
 Add realistic-gazelle snapshot:
 python track_ab_scores.py add --project realistic-gazelle --submission-id 23 --score-recent 0.861 --score-steady 0.928 --score-anchor 0.742 --anchor-1h 0.810 --anchor-24h 0.760 --notes "daily snapshot"
