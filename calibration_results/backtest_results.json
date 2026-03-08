@@ -1,0 +1,87 @@
+{
+  "generated": "2026-03-08T02:57:27.930183+00:00",
+  "backtest_days": 14,
+  "results": {
+    "BTC": {
+      "tail_type": "t",
+      "tail_w": 0.2,
+      "t_scale_mult": 0.3,
+      "df": 4.2,
+      "ewma_lam": 0.88,
+      "lookback": 250,
+      "crps": 0.04063248008089154
+    },
+    "ETH": {
+      "tail_type": "t",
+      "tail_w": 0.38999999999999996,
+      "t_scale_mult": 0.5,
+      "df": 3.0,
+      "ewma_lam": 0.92,
+      "lookback": 200,
+      "crps": 0.028568639867891456
+    },
+    "XAUT": {
+      "tail_type": "t",
+      "tail_w": 0.33999999999999997,
+      "t_scale_mult": 0.5,
+      "df": 6.8,
+      "ewma_lam": 0.86,
+      "lookback": 50,
+      "crps": 0.06709965824225082
+    },
+    "SOL": {
+      "tail_type": "t",
+      "tail_w": 0.33999999999999997,
+      "t_scale_mult": 0.5,
+      "df": 3.4,
+      "ewma_lam": 0.92,
+      "lookback": 200,
+      "crps": 0.028388842373328886
+    },
+    "SPYX": {
+      "tail_type": "t",
+      "tail_w": 0.38999999999999996,
+      "t_scale_mult": 0.5,
+      "df": 30.0,
+      "ewma_lam": 0.86,
+      "lookback": 175,
+      "crps": 0.031394426511215476
+    },
+    "NVDAX": {
+      "tail_type": "t",
+      "tail_w": 0.38999999999999996,
+      "t_scale_mult": 0.5,
+      "df": 30.0,
+      "ewma_lam": 0.86,
+      "lookback": 100,
+      "crps": 0.037613723634162786
+    },
+    "TSLAX": {
+      "tail_type": "t",
+      "tail_w": 0.37,
+      "t_scale_mult": 0.7,
+      "df": 30.0,
+      "ewma_lam": 0.86,
+      "lookback": 100,
+      "crps": 0.024950490827365
+    },
+    "AAPLX": {
+      "tail_type": "t",
+      "tail_w": 0.35,
+      "t_scale_mult": 0.3,
+      "df": 30.0,
+      "ewma_lam": 0.94,
+      "lookback": 250,
+      "crps": 0.03582917038727935
+    },
+    "GOOGLX": {
+      "tail_type": "t",
+      "tail_w": 0.38999999999999996,
+      "t_scale_mult": 0.5,
+      "df": 30.0,
+      "ewma_lam": 0.88,
+      "lookback": 75,
+      "crps": 0.02652893747682125
+    }
+  }
+}

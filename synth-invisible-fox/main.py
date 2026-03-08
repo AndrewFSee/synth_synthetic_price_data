@@ -1,12 +1,12 @@
 """
-CrunchDAO Synth Competition -- Adaptive GARCH + Student-t (invisible-fox)
+CrunchDAO Synth Competition -- Calibrated GARCH + Student-t (invisible-fox)
 
-Regime-adaptive probabilistic forecasting:
-- EWMA variance seeding (reacts ~6x faster than simple variance)
-- Multi-scale regime detection (short vs long window volatility ratio)
-- Adaptive GARCH alpha (faster reaction during regime changes)
-- Dynamic component weights (less pretrained, more tail during transitions)
-- Multi-step GARCH evolution (correct variance growth for all time steps)
+v20 — Empirically calibrated from 90-day pricedb backtest.
+Per-asset optimal parameters from CRPS grid search:
+  - t_scale_mult 0.3–0.7 × sigma (NARROWER Student-t creates leptokurtic peak)
+  - Crypto: low df (3–7), higher ewma reactivity
+  - Stocks: high df (~30, near-Gaussian tails), shorter lookback
+GARCH multi-step evolution for longer horizons.
 MAX 3 leaf components per density (framework limit).
 """
 
@@ -18,23 +18,27 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from crunch_synth import TrackerBase
 
-# Asset-specific 5-min sigma defaults (rough calibration from CRPS bounds)
+# Asset-specific 5-min sigma defaults (fallback when no data)
 _DEFAULT_SIGMA_5M: Dict[str, float] = {
     "BTC": 300.0, "ETH": 18.0, "SOL": 0.9, "XAUT": 7.0,
     "SPYX": 0.7, "NVDAX": 0.5, "TSLAX": 1.3, "AAPLX": 0.45, "GOOGLX": 0.7,
 }
 
-# Asset-specific tuning: adjust density width for worst-performing assets.
-# ri_damp:      Dampen regime intensity (SOL's vol-of-vol inflates ri too much)
-# t_scale_base: Base multiplier for Student-t scale (default 1.8)
-# clamp_max:    Max sigma as fraction of price (default 0.015)
-# tail_adj:     Additive adjustment to tail weight (default 0.0)
-_ASSET_TUNING: Dict[str, Dict[str, float]] = {
-    "SOL":   {"ri_damp": 0.6, "t_scale_base": 1.4, "clamp_max": 0.010, "tail_adj": -0.06},
-    "BTC":   {"ri_damp": 0.8, "t_scale_base": 1.6, "clamp_max": 0.012, "tail_adj": -0.03},
-    "SPYX":  {"ri_damp": 0.8, "t_scale_base": 1.6, "clamp_max": 0.012, "tail_adj": -0.03},
-    "ETH":   {"ri_damp": 0.9, "t_scale_base": 1.7, "clamp_max": 0.013, "tail_adj": -0.02},
+# ── Empirically calibrated per-asset density parameters ──────────────────────
+# From calibrate.py CRPS grid search on 90-day pricedb data.
+# Keys: tail_w, tsm (t_scale_mult), df, ewma_lam, lookback
+_CAL: Dict[str, Dict[str, float]] = {
+    "BTC":    {"tail_w": 0.20, "tsm": 0.30, "df": 4.2, "lam": 0.88, "lb": 250},
+    "ETH":    {"tail_w": 0.39, "tsm": 0.50, "df": 3.0, "lam": 0.92, "lb": 200},
+    "XAUT":   {"tail_w": 0.34, "tsm": 0.50, "df": 6.8, "lam": 0.86, "lb":  50},
+    "SOL":    {"tail_w": 0.34, "tsm": 0.50, "df": 3.4, "lam": 0.92, "lb": 200},
+    "SPYX":   {"tail_w": 0.39, "tsm": 0.50, "df": 30., "lam": 0.86, "lb": 175},
+    "NVDAX":  {"tail_w": 0.39, "tsm": 0.50, "df": 30., "lam": 0.86, "lb": 100},
+    "TSLAX":  {"tail_w": 0.37, "tsm": 0.70, "df": 30., "lam": 0.86, "lb": 100},
+    "AAPLX":  {"tail_w": 0.35, "tsm": 0.30, "df": 30., "lam": 0.94, "lb": 250},
+    "GOOGLX": {"tail_w": 0.39, "tsm": 0.50, "df": 30., "lam": 0.88, "lb":  75},
 }
+_CAL_DEFAULT = {"tail_w": 0.35, "tsm": 0.50, "df": 8.0, "lam": 0.90, "lb": 200}
 
 
 class MyTracker(TrackerBase):
@@ -241,62 +245,61 @@ class MyTracker(TrackerBase):
         if len(returns) < 10:
             return self._default_predictions(asset, horizon, step)
 
-        # ── Lookback & GARCH parameters (unified across horizons) ──
-        lookback = 300       # 25h
-        ewma_lam = 0.94
-        garch_win = 48       # 4h
+        # ── Calibrated per-asset parameters ──
+        cal = _CAL.get(asset, _CAL_DEFAULT)
+        tail_w_cal = cal["tail_w"]
+        t_scale_mult = cal["tsm"]
+        df_cal = cal["df"]
+        ewma_lam = cal["lam"]
+        lookback = int(cal["lb"])
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
 
-        # ── Asset-specific tuning ──
-        tuning = _ASSET_TUNING.get(asset, {})
-        ri_damp = tuning.get("ri_damp", 1.0)
-        t_scale_base = tuning.get("t_scale_base", 1.8)
-        clamp_max_pct = tuning.get("clamp_max", 0.015)
-        tail_adj = tuning.get("tail_adj", 0.0)
-
-        # ── Regime change detection ──
-        fast_std, slow_std, ri_raw = self._vol_regime(recent)
-        ri = ri_raw * ri_damp   # dampen for high-vol-of-vol assets
+        # ── Regime detection (kept light — sigma blending + GARCH adaptation) ──
+        fast_std, slow_std, ri = self._vol_regime(recent)
         blend_fast = 0.3 + 0.5 * ri
         sigma_base = blend_fast * fast_std + (1 - blend_fast) * slow_std
 
-        # ── Adaptive GARCH ──
-        gw = recent[-garch_win:] if len(recent) >= garch_win else recent
-        omega, alpha, beta = self._estimate_garch_adaptive(gw, ri)
+        # ── EWMA variance with calibrated lambda ──
+        garch_win = min(48, len(recent))
+        gw = recent[-garch_win:]
         current_var = self._ewma_var(gw, lam=ewma_lam)
+        omega, alpha, beta = self._estimate_garch_adaptive(gw, ri)
         last_shock = float((recent[-1] - np.mean(recent[-12:])) ** 2)
 
-        # Clamps (asset-specific max)
+        # ── Sigma clamps ──
         if last_price > 0:
             min_scale = 0.0003 * last_price
-            max_scale = clamp_max_pct * last_price * (1 + 0.5 * ri)
+            max_scale = 0.015 * last_price * (1 + 0.5 * ri)
         else:
             min_scale, max_scale = 1e-6, sigma_base * 8.0
 
-        # Pretrained: compute ONCE at base resolution
+        # ── Pretrained baseline ──
         pre_base = self._pretrained_base(recent)
 
-        # ── Dynamic component weights (with asset-specific tail adjustment) ──
+        # ── Component weights ──
+        # Small ri adjustment: slightly more tail during regime changes
+        tail_w = min(0.50, tail_w_cal + 0.05 * ri)
+
         if pre_base:
-            tail_w = max(0.08, 0.20 + 0.15 * ri + tail_adj)
-            pre_w  = 0.30 - 0.21 * ri
-            core_w = 1.0 - tail_w - pre_w
+            pre_w = max(0.05, 0.25 - 0.15 * ri)
+            core_w = max(0.10, 1.0 - tail_w - pre_w)
+            # Re-normalize if needed
+            s = core_w + tail_w + pre_w
+            core_w, tail_w, pre_w = core_w / s, tail_w / s, pre_w / s
         else:
-            tail_w = max(0.15, 0.35 + 0.10 * ri + tail_adj)
+            tail_w = min(0.55, tail_w + 0.05)  # extra tail when no pretrained
             core_w = 1.0 - tail_w
 
-        # Student-t df: lower = heavier tails during regime changes
-        df = max(3.0, 5.0 - 2.0 * ri)
+        # ── df: small regime adjustment for crypto ──
+        df = max(2.5, df_cal - 1.0 * ri) if df_cal < 25 else df_cal
 
         scale_factor = step / resolution
         sqrt_sf = math.sqrt(max(scale_factor, 1e-6))
         num_segments = horizon // step
         distributions: List[Dict[str, Any]] = []
 
-        # For sub-resolution steps (step < 300s), GARCH evolves fractionally
-        # For super-resolution steps (step >= 300s), evolve multiple sub-steps
         n_sub = max(1, int(scale_factor))
 
         var_t = current_var
@@ -309,7 +312,6 @@ class MyTracker(TrackerBase):
                     var_sum += var_t
                 avg_var = var_sum / n_sub
             else:
-                # Sub-resolution: fractional GARCH step
                 var_t = omega * scale_factor + alpha * last_shock * scale_factor + beta * var_t
                 last_shock = var_t
                 avg_var = var_t
@@ -318,7 +320,7 @@ class MyTracker(TrackerBase):
             sigma = blend_fast * garch_sig + (1 - blend_fast) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
-            t_scale = sigma * (t_scale_base + 0.5 * ri)
+            t_scale = sigma * t_scale_mult
 
             if pre_base:
                 pre_loc = pre_base["loc"] * scale_factor
