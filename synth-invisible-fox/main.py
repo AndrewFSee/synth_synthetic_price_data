@@ -1,22 +1,117 @@
 """
 CrunchDAO Synth Competition -- GARCH + Adaptive Tails (invisible-fox)
 
-v21 — Targeted improvements for weak 24h stock predictions:
-  1. Updated stock params from v2 train/test calibration (GOOGLX, SPYX, etc.)
-  2. Laplace tails for stocks (df>=20 Student-t ~ Normal, wastes component)
-  3. Step-adaptive sigma: reduce GARCH influence on long steps
-     (GARCH converges to unconditional var, losing current regime info)
-  4. Crypto params unchanged (1h rank 34, working well)
+v22 — v21 improvements + external volatility signals:
+  v21: stock params from v2 calibration, Laplace tails, step-adaptive sigma
+  v22: VIX (Yahoo Finance) for stocks, Fear & Greed (alternative.me) for crypto
+       Both cached 1h, graceful fallback to neutral (1.0) on failure.
 MAX 3 leaf components per density (framework limit).
 """
 
+import json
 import math
 import numpy as np
 import pickle
 import re
+import time
+import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from crunch_synth import TrackerBase
+
+# ── External volatility signals ──────────────────────────────────────────────
+_STOCK_ASSETS = {"SPYX", "NVDAX", "TSLAX", "AAPLX", "GOOGLX"}
+_CRYPTO_ASSETS = {"BTC", "ETH", "SOL", "XAUT"}
+_VIX_BASELINE = 20.0   # long-term average VIX
+_FNG_NEUTRAL = 50       # Fear & Greed neutral point
+
+
+class _ExternalSignals:
+    """Cached VIX + Fear & Greed fetcher.  Graceful fallback to neutral."""
+
+    _TTL = 3600  # refresh at most once per hour
+
+    def __init__(self):
+        self._vix: float = _VIX_BASELINE
+        self._vix_ts: float = 0.0
+        self._fng: int = _FNG_NEUTRAL
+        self._fng_ts: float = 0.0
+
+    @staticmethod
+    def _get_json(url: str, timeout: int = 5) -> Any:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; SynthTracker)"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+    # ── VIX (Yahoo Finance) ──────────────────────────────────────────
+
+    def _refresh_vix(self) -> None:
+        now = time.time()
+        if now - self._vix_ts < self._TTL:
+            return
+        try:
+            data = self._get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/"
+                "%5EVIX?interval=1d&range=2d"
+            )
+            v = float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
+            if 5.0 <= v <= 100.0:
+                self._vix = v
+        except Exception:
+            pass
+        self._vix_ts = now
+
+    def stock_vol_mult(self) -> float:
+        """VIX-based sigma multiplier for stock assets.
+
+        VIX=20 → 1.0;  VIX=30 → 1.22;  VIX=12 → 0.77
+        Clamped to [0.7, 1.6] for safety.
+        """
+        self._refresh_vix()
+        mult = math.sqrt(self._vix / _VIX_BASELINE)
+        return max(0.7, min(1.6, mult))
+
+    # ── Fear & Greed Index (alternative.me) ──────────────────────────
+
+    def _refresh_fng(self) -> None:
+        now = time.time()
+        if now - self._fng_ts < self._TTL:
+            return
+        try:
+            data = self._get_json("https://api.alternative.me/fng/?limit=1")
+            v = int(data["data"][0]["value"])
+            if 0 <= v <= 100:
+                self._fng = v
+        except Exception:
+            pass
+        self._fng_ts = now
+
+    def crypto_vol_mult(self) -> float:
+        """Fear & Greed-based sigma multiplier for crypto assets.
+
+        Extreme fear (0-20) → wider distributions (up to 1.25×).
+        Fear (20-40) → slightly wider (up to 1.10×).
+        Neutral (40-60) → 1.0.
+        Greed (60-80) → slightly narrower (down to 0.92).
+        Extreme greed (80-100) → tail risk, slightly wider (up to 1.10×).
+        """
+        self._refresh_fng()
+        fng = self._fng
+        if fng < 20:
+            return 1.0 + 0.0125 * (20 - fng)     # 1.0–1.25
+        elif fng < 40:
+            return 1.0 + 0.005 * (40 - fng)       # 1.0–1.10
+        elif fng <= 60:
+            return 1.0                              # neutral
+        elif fng <= 80:
+            return max(0.92, 1.0 - 0.004 * (fng - 60))  # 0.92–1.0
+        else:
+            return 1.0 + 0.005 * (fng - 80)       # 1.0–1.10 (complacency)
+
+
+_ext = _ExternalSignals()
 
 # Asset-specific 5-min sigma defaults (fallback when no data)
 _DEFAULT_SIGMA_5M: Dict[str, float] = {
@@ -263,6 +358,12 @@ class MyTracker(TrackerBase):
         fast_std, slow_std, ri = self._vol_regime(recent)
         blend_fast = 0.3 + 0.5 * ri
         sigma_base = blend_fast * fast_std + (1 - blend_fast) * slow_std
+
+        # ── External vol signal ──
+        if asset in _STOCK_ASSETS:
+            sigma_base *= _ext.stock_vol_mult()
+        elif asset in _CRYPTO_ASSETS:
+            sigma_base *= _ext.crypto_vol_mult()
 
         # ── EWMA variance with calibrated lambda ──
         garch_win = min(48, len(recent))
