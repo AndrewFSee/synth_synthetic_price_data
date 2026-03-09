@@ -1,12 +1,12 @@
 """
-CrunchDAO Synth Competition -- Calibrated GARCH + Student-t (invisible-fox)
+CrunchDAO Synth Competition -- GARCH + Adaptive Tails (invisible-fox)
 
-v20 — Empirically calibrated from 90-day pricedb backtest.
-Per-asset optimal parameters from CRPS grid search:
-  - t_scale_mult 0.3–0.7 × sigma (NARROWER Student-t creates leptokurtic peak)
-  - Crypto: low df (3–7), higher ewma reactivity
-  - Stocks: high df (~30, near-Gaussian tails), shorter lookback
-GARCH multi-step evolution for longer horizons.
+v21 — Targeted improvements for weak 24h stock predictions:
+  1. Updated stock params from v2 train/test calibration (GOOGLX, SPYX, etc.)
+  2. Laplace tails for stocks (df>=20 Student-t ~ Normal, wastes component)
+  3. Step-adaptive sigma: reduce GARCH influence on long steps
+     (GARCH converges to unconditional var, losing current regime info)
+  4. Crypto params unchanged (1h rank 34, working well)
 MAX 3 leaf components per density (framework limit).
 """
 
@@ -25,18 +25,21 @@ _DEFAULT_SIGMA_5M: Dict[str, float] = {
 }
 
 # ── Empirically calibrated per-asset density parameters ──────────────────────
-# From calibrate.py CRPS grid search on 90-day pricedb data.
+# Crypto: v20 params (performing well on 1h, rank 34).
+# Stocks: v2 train/test calibration (longer lb, smoother lam for stability).
 # Keys: tail_w, tsm (t_scale_mult), df, ewma_lam, lookback
 _CAL: Dict[str, Dict[str, float]] = {
+    # Crypto — keep v20 params
     "BTC":    {"tail_w": 0.20, "tsm": 0.30, "df": 4.2, "lam": 0.88, "lb": 250},
     "ETH":    {"tail_w": 0.39, "tsm": 0.50, "df": 3.0, "lam": 0.92, "lb": 200},
     "XAUT":   {"tail_w": 0.34, "tsm": 0.50, "df": 6.8, "lam": 0.86, "lb":  50},
     "SOL":    {"tail_w": 0.34, "tsm": 0.50, "df": 3.4, "lam": 0.92, "lb": 200},
-    "SPYX":   {"tail_w": 0.39, "tsm": 0.50, "df": 30., "lam": 0.86, "lb": 175},
-    "NVDAX":  {"tail_w": 0.39, "tsm": 0.50, "df": 30., "lam": 0.86, "lb": 100},
-    "TSLAX":  {"tail_w": 0.37, "tsm": 0.70, "df": 30., "lam": 0.86, "lb": 100},
-    "AAPLX":  {"tail_w": 0.35, "tsm": 0.30, "df": 30., "lam": 0.94, "lb": 250},
-    "GOOGLX": {"tail_w": 0.39, "tsm": 0.50, "df": 30., "lam": 0.88, "lb":  75},
+    # Stocks — v2 calibration (longer lookback, smoother EWMA)
+    "SPYX":   {"tail_w": 0.29, "tsm": 0.30, "df": 16., "lam": 0.92, "lb": 250},
+    "NVDAX":  {"tail_w": 0.24, "tsm": 0.40, "df": 30., "lam": 0.86, "lb": 225},
+    "TSLAX":  {"tail_w": 0.39, "tsm": 0.60, "df": 30., "lam": 0.91, "lb": 175},
+    "AAPLX":  {"tail_w": 0.39, "tsm": 0.40, "df": 30., "lam": 0.90, "lb": 375},
+    "GOOGLX": {"tail_w": 0.39, "tsm": 0.30, "df": 30., "lam": 0.90, "lb": 175},
 }
 _CAL_DEFAULT = {"tail_w": 0.35, "tsm": 0.50, "df": 8.0, "lam": 0.90, "lb": 200}
 
@@ -317,10 +320,27 @@ class MyTracker(TrackerBase):
                 avg_var = var_t
 
             garch_sig = math.sqrt(max(avg_var * scale_factor, 1e-10))
-            sigma = blend_fast * garch_sig + (1 - blend_fast) * (sigma_base * sqrt_sf)
+            # Step-adaptive blending: GARCH converges to unconditional variance
+            # over many sub-steps, losing current regime info.  For long steps,
+            # rely more on sigma_base (current vol) scaled by sqrt(time).
+            # sf=1 → gd=0.98; sf=12 → 0.80; sf=72 → 0.40; sf=288 → 0.14
+            garch_decay = 1.0 / (1.0 + scale_factor / 48.0)
+            eff_blend = blend_fast * garch_decay
+            sigma = eff_blend * garch_sig + (1 - eff_blend) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
             t_scale = sigma * t_scale_mult
+
+            # Tail component: Laplace for stocks (df>=20 -> Student-t ~ Normal,
+            # wastes component slot).  Keep Student-t for crypto (genuine fat tails).
+            if df_cal >= 20:
+                tail_comp = {"density": {"type": "builtin", "name": "laplace",
+                                          "params": {"loc": 0.0, "scale": t_scale}},
+                              "weight": tail_w}
+            else:
+                tail_comp = {"density": {"type": "builtin", "name": "t",
+                                          "params": {"df": df, "loc": 0.0, "scale": t_scale}},
+                              "weight": tail_w}
 
             if pre_base:
                 pre_loc = pre_base["loc"] * scale_factor
@@ -329,9 +349,7 @@ class MyTracker(TrackerBase):
                     {"density": {"type": "builtin", "name": "norm",
                                  "params": {"loc": 0.0, "scale": sigma}},
                      "weight": core_w},
-                    {"density": {"type": "builtin", "name": "t",
-                                 "params": {"df": df, "loc": 0.0, "scale": t_scale}},
-                     "weight": tail_w},
+                    tail_comp,
                     {"density": {"type": "builtin", "name": "norm",
                                  "params": {"loc": pre_loc, "scale": pre_scale}},
                      "weight": pre_w},
@@ -341,9 +359,7 @@ class MyTracker(TrackerBase):
                     {"density": {"type": "builtin", "name": "norm",
                                  "params": {"loc": 0.0, "scale": sigma}},
                      "weight": core_w},
-                    {"density": {"type": "builtin", "name": "t",
-                                 "params": {"df": df, "loc": 0.0, "scale": t_scale}},
-                     "weight": tail_w},
+                    tail_comp,
                 ]
 
             distributions.append({
