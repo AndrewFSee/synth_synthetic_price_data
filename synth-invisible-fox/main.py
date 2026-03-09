@@ -27,15 +27,30 @@ _FNG_NEUTRAL = 50       # Fear & Greed neutral point
 
 
 class _ExternalSignals:
-    """Cached VIX + Fear & Greed fetcher.  Graceful fallback to neutral."""
+    """Cached VIX + Fear & Greed fetcher with staleness decay.
 
-    _TTL = 3600  # refresh at most once per hour
+    Tokenized stocks trade 24/7 but VIX only updates during US market hours
+    (~6.5h/day).  Fear & Greed updates once daily.  To avoid applying a stale
+    signal as if it were fresh, multipliers decay toward 1.0 (neutral) as
+    the data ages:
+      - VIX:  full weight for 1h, linear decay to neutral over 6h
+      - F&G:  full weight for 6h, linear decay to neutral over 24h
+    """
+
+    _VIX_TTL = 900      # re-fetch every 15 min (captures intraday moves)
+    _FNG_TTL = 3600      # re-fetch every 1h (only changes daily anyway)
+    _VIX_FRESH = 3600    # full signal weight for 1h after fetch
+    _VIX_STALE = 21600   # decays to neutral by 6h after fetch
+    _FNG_FRESH = 21600   # full signal weight for 6h
+    _FNG_STALE = 86400   # decays to neutral by 24h
 
     def __init__(self):
         self._vix: float = _VIX_BASELINE
-        self._vix_ts: float = 0.0
+        self._vix_ts: float = 0.0          # last successful fetch time
+        self._vix_fetch_ts: float = 0.0    # last fetch attempt time
         self._fng: int = _FNG_NEUTRAL
         self._fng_ts: float = 0.0
+        self._fng_fetch_ts: float = 0.0
 
     @staticmethod
     def _get_json(url: str, timeout: int = 5) -> Any:
@@ -45,12 +60,22 @@ class _ExternalSignals:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
 
+    @staticmethod
+    def _staleness_weight(age: float, fresh: float, stale: float) -> float:
+        """1.0 when age < fresh, linear decay to 0.0 at age >= stale."""
+        if age <= fresh:
+            return 1.0
+        if age >= stale:
+            return 0.0
+        return (stale - age) / (stale - fresh)
+
     # ── VIX (Yahoo Finance) ──────────────────────────────────────────
 
     def _refresh_vix(self) -> None:
         now = time.time()
-        if now - self._vix_ts < self._TTL:
+        if now - self._vix_fetch_ts < self._VIX_TTL:
             return
+        self._vix_fetch_ts = now
         try:
             data = self._get_json(
                 "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -59,56 +84,61 @@ class _ExternalSignals:
             v = float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
             if 5.0 <= v <= 100.0:
                 self._vix = v
+                self._vix_ts = now   # mark data as fresh
         except Exception:
             pass
-        self._vix_ts = now
 
     def stock_vol_mult(self) -> float:
-        """VIX-based sigma multiplier for stock assets.
+        """VIX-based sigma multiplier for stock assets with staleness decay.
 
-        VIX=20 → 1.0;  VIX=30 → 1.22;  VIX=12 → 0.77
+        Fresh VIX=30 → 1.22;  6h-stale VIX=30 → 1.0 (neutral).
         Clamped to [0.7, 1.6] for safety.
         """
         self._refresh_vix()
-        mult = math.sqrt(self._vix / _VIX_BASELINE)
-        return max(0.7, min(1.6, mult))
+        raw_mult = math.sqrt(self._vix / _VIX_BASELINE)
+        raw_mult = max(0.7, min(1.6, raw_mult))
+        # Decay toward 1.0 as data ages
+        age = time.time() - self._vix_ts
+        w = self._staleness_weight(age, self._VIX_FRESH, self._VIX_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
 
     # ── Fear & Greed Index (alternative.me) ──────────────────────────
 
     def _refresh_fng(self) -> None:
         now = time.time()
-        if now - self._fng_ts < self._TTL:
+        if now - self._fng_fetch_ts < self._FNG_TTL:
             return
+        self._fng_fetch_ts = now
         try:
             data = self._get_json("https://api.alternative.me/fng/?limit=1")
             v = int(data["data"][0]["value"])
             if 0 <= v <= 100:
                 self._fng = v
+                self._fng_ts = now
         except Exception:
             pass
-        self._fng_ts = now
 
     def crypto_vol_mult(self) -> float:
-        """Fear & Greed-based sigma multiplier for crypto assets.
+        """Fear & Greed-based sigma multiplier with staleness decay.
 
-        Extreme fear (0-20) → wider distributions (up to 1.25×).
-        Fear (20-40) → slightly wider (up to 1.10×).
-        Neutral (40-60) → 1.0.
-        Greed (60-80) → slightly narrower (down to 0.92).
-        Extreme greed (80-100) → tail risk, slightly wider (up to 1.10×).
+        Extreme fear (0-20) → up to 1.25×, decays to neutral over 24h.
         """
         self._refresh_fng()
         fng = self._fng
         if fng < 20:
-            return 1.0 + 0.0125 * (20 - fng)     # 1.0–1.25
+            raw_mult = 1.0 + 0.0125 * (20 - fng)     # 1.0–1.25
         elif fng < 40:
-            return 1.0 + 0.005 * (40 - fng)       # 1.0–1.10
+            raw_mult = 1.0 + 0.005 * (40 - fng)       # 1.0–1.10
         elif fng <= 60:
-            return 1.0                              # neutral
+            raw_mult = 1.0                              # neutral
         elif fng <= 80:
-            return max(0.92, 1.0 - 0.004 * (fng - 60))  # 0.92–1.0
+            raw_mult = max(0.92, 1.0 - 0.004 * (fng - 60))  # 0.92–1.0
         else:
-            return 1.0 + 0.005 * (fng - 80)       # 1.0–1.10 (complacency)
+            raw_mult = 1.0 + 0.005 * (fng - 80)       # 1.0–1.10
+        # Decay toward 1.0 as data ages
+        age = time.time() - self._fng_ts
+        w = self._staleness_weight(age, self._FNG_FRESH, self._FNG_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
 
 
 _ext = _ExternalSignals()
