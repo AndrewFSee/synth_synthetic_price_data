@@ -1,12 +1,12 @@
 """
 CrunchDAO Synth Competition -- Adaptive Multi-scale + Laplace (realistic-gazelle)
 
-Regime-adaptive probabilistic forecasting:
-- Three-scale volatility blend (1.5h / 4h / 12h windows)
-- EWMA variance seeding (lambda=0.97, smoother than fox for diversity)
-- Adaptive GARCH with regime-dependent reaction speed
-- Dynamic weights: more Laplace, less pretrained during transitions
-- Multi-step GARCH evolution (correct variance growth for all time steps)
+v24 — Per-asset calibrated params + step-adaptive sigma:
+  1. v2 train/test calibrated per-asset params (lookback, ewma_lam, tail_w, lap_mult)
+     Fixes SPYX 24h (rank 96) and other weak stock dimensions
+  2. Step-adaptive sigma: reduce GARCH influence on long steps
+     (GARCH converges to unconditional var, losing current regime info)
+  3. Keep multi-scale + Laplace architecture (no external data — fox-only)
 MAX 3 leaf components per density (framework limit).
 """
 
@@ -23,6 +23,24 @@ _DEFAULT_SIGMA_5M: Dict[str, float] = {
     "BTC": 300.0, "ETH": 18.0, "SOL": 0.9, "XAUT": 7.0,
     "SPYX": 0.7, "NVDAX": 0.5, "TSLAX": 1.3, "AAPLX": 0.45, "GOOGLX": 0.7,
 }
+
+# ── Per-asset calibrated parameters ──────────────────────────────────────────
+# From v2 train/test calibration.  Gazelle uses lap_mult instead of df/tsm.
+# Keys: tail_w, lap_mult, ewma_lam, lookback
+_CAL: Dict[str, Dict[str, float]] = {
+    # Crypto
+    "BTC":    {"tail_w": 0.20, "lap_mult": 1.2, "lam": 0.94, "lb": 250},
+    "ETH":    {"tail_w": 0.39, "lap_mult": 1.5, "lam": 0.94, "lb": 200},
+    "XAUT":   {"tail_w": 0.37, "lap_mult": 1.5, "lam": 0.94, "lb": 375},
+    "SOL":    {"tail_w": 0.34, "lap_mult": 1.4, "lam": 0.94, "lb": 225},
+    # Stocks — longer lookback, smoother EWMA
+    "SPYX":   {"tail_w": 0.29, "lap_mult": 1.2, "lam": 0.95, "lb": 250},
+    "NVDAX":  {"tail_w": 0.24, "lap_mult": 1.3, "lam": 0.93, "lb": 225},
+    "TSLAX":  {"tail_w": 0.39, "lap_mult": 1.5, "lam": 0.94, "lb": 175},
+    "AAPLX":  {"tail_w": 0.39, "lap_mult": 1.3, "lam": 0.95, "lb": 375},
+    "GOOGLX": {"tail_w": 0.39, "lap_mult": 1.2, "lam": 0.95, "lb": 175},
+}
+_CAL_DEFAULT = {"tail_w": 0.30, "lap_mult": 1.4, "lam": 0.94, "lb": 200}
 
 
 class MyTracker(TrackerBase):
@@ -225,9 +243,12 @@ class MyTracker(TrackerBase):
         if len(returns) < 10:
             return self._default_predictions(asset, horizon, step)
 
-        # ── Lookback & GARCH parameters (unified across horizons) ──
-        lookback = 300         # 25h (same for all horizons)
-        ewma_lam = 0.97        # smooth EWMA
+        # ── Per-asset calibrated parameters ──
+        cal = _CAL.get(asset, _CAL_DEFAULT)
+        tail_w_cal = cal["tail_w"]
+        lap_mult_base = cal["lap_mult"]
+        ewma_lam = cal["lam"]
+        lookback = int(cal["lb"])
         garch_win = 72         # 6h
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
@@ -256,13 +277,15 @@ class MyTracker(TrackerBase):
         # Pretrained: compute ONCE at base resolution
         pre_base = self._pretrained_base(recent)
 
-        # ── Dynamic weights (unified across horizons) ──
+        # ── Dynamic weights (per-asset calibrated) ──
+        tail_w = min(0.50, tail_w_cal + 0.10 * ri)
         if pre_base:
-            tail_w = 0.30 + 0.10 * ri
-            pre_w  = 0.20 - 0.15 * ri
-            core_w = 1.0 - tail_w - pre_w
+            pre_w  = max(0.05, 0.20 - 0.15 * ri)
+            core_w = max(0.10, 1.0 - tail_w - pre_w)
+            s = core_w + tail_w + pre_w
+            core_w, tail_w, pre_w = core_w / s, tail_w / s, pre_w / s
         else:
-            tail_w = 0.40 + 0.10 * ri
+            tail_w = min(0.55, tail_w + 0.05)
             core_w = 1.0 - tail_w
 
         scale_factor = step / resolution
@@ -288,11 +311,15 @@ class MyTracker(TrackerBase):
                 avg_var = var_t
 
             garch_sig = math.sqrt(max(avg_var * scale_factor, 1e-10))
-            sigma = blend_fast * garch_sig + (1 - blend_fast) * (sigma_base * sqrt_sf)
+            # Step-adaptive: GARCH converges to unconditional var over many
+            # sub-steps.  Reduce GARCH weight for long steps.
+            garch_decay = 1.0 / (1.0 + scale_factor / 48.0)
+            eff_blend = blend_fast * garch_decay
+            sigma = eff_blend * garch_sig + (1 - eff_blend) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
-            # Laplace scale: keep same multiplier for both horizons
-            lap_mult = 1.5 + 0.8 * ri
+            # Laplace scale: per-asset calibrated multiplier
+            lap_mult = lap_mult_base + 0.8 * ri
             lap_scale = sigma * lap_mult
 
             if pre_base:
