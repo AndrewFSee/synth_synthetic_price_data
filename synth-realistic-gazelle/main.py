@@ -1,22 +1,125 @@
 """
 CrunchDAO Synth Competition -- Adaptive Multi-scale + Laplace (realistic-gazelle)
 
-v24 — Per-asset calibrated params + step-adaptive sigma:
-  1. v2 train/test calibrated per-asset params (lookback, ewma_lam, tail_w, lap_mult)
-     Fixes SPYX 24h (rank 96) and other weak stock dimensions
-  2. Step-adaptive sigma: reduce GARCH influence on long steps
-     (GARCH converges to unconditional var, losing current regime info)
-  3. Keep multi-scale + Laplace architecture (no external data — fox-only)
+v25 — v24 + external volatility signals (VIX + Fear & Greed):
+  v24: per-asset calibrated params, step-adaptive sigma
+  v25: VIX (Yahoo Finance) for stocks, Fear & Greed (alternative.me) for crypto
+       Both cached, staleness decay toward neutral as data ages.
+       Evidence: fox (with signals) held rank 20 during Mar 14 dip while
+       gazelle (without) crashed to rank 55.
 MAX 3 leaf components per density (framework limit).
 """
 
+import json
 import math
 import numpy as np
 import pickle
 import re
+import time
+import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from crunch_synth import TrackerBase
+
+# ── External volatility signals ──────────────────────────────────────────────
+_STOCK_ASSETS = {"SPYX", "NVDAX", "TSLAX", "AAPLX", "GOOGLX"}
+_CRYPTO_ASSETS = {"BTC", "ETH", "SOL", "XAUT"}
+_VIX_BASELINE = 20.0
+_FNG_NEUTRAL = 50
+
+
+class _ExternalSignals:
+    """Cached VIX + Fear & Greed fetcher with staleness decay."""
+
+    _VIX_TTL = 900
+    _FNG_TTL = 3600
+    _VIX_FRESH = 3600
+    _VIX_STALE = 21600
+    _FNG_FRESH = 21600
+    _FNG_STALE = 86400
+
+    def __init__(self):
+        self._vix: float = _VIX_BASELINE
+        self._vix_ts: float = 0.0
+        self._vix_fetch_ts: float = 0.0
+        self._fng: int = _FNG_NEUTRAL
+        self._fng_ts: float = 0.0
+        self._fng_fetch_ts: float = 0.0
+
+    @staticmethod
+    def _get_json(url: str, timeout: int = 5) -> Any:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; SynthTracker)"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+    @staticmethod
+    def _staleness_weight(age: float, fresh: float, stale: float) -> float:
+        if age <= fresh:
+            return 1.0
+        if age >= stale:
+            return 0.0
+        return (stale - age) / (stale - fresh)
+
+    def _refresh_vix(self) -> None:
+        now = time.time()
+        if now - self._vix_fetch_ts < self._VIX_TTL:
+            return
+        self._vix_fetch_ts = now
+        try:
+            data = self._get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/"
+                "%5EVIX?interval=1d&range=2d"
+            )
+            v = float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
+            if 5.0 <= v <= 100.0:
+                self._vix = v
+                self._vix_ts = now
+        except Exception:
+            pass
+
+    def stock_vol_mult(self) -> float:
+        self._refresh_vix()
+        raw_mult = math.sqrt(self._vix / _VIX_BASELINE)
+        raw_mult = max(0.7, min(1.6, raw_mult))
+        age = time.time() - self._vix_ts
+        w = self._staleness_weight(age, self._VIX_FRESH, self._VIX_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
+
+    def _refresh_fng(self) -> None:
+        now = time.time()
+        if now - self._fng_fetch_ts < self._FNG_TTL:
+            return
+        self._fng_fetch_ts = now
+        try:
+            data = self._get_json("https://api.alternative.me/fng/?limit=1")
+            v = int(data["data"][0]["value"])
+            if 0 <= v <= 100:
+                self._fng = v
+                self._fng_ts = now
+        except Exception:
+            pass
+
+    def crypto_vol_mult(self) -> float:
+        self._refresh_fng()
+        fng = self._fng
+        if fng < 20:
+            raw_mult = 1.0 + 0.0125 * (20 - fng)
+        elif fng < 40:
+            raw_mult = 1.0 + 0.005 * (40 - fng)
+        elif fng <= 60:
+            raw_mult = 1.0
+        elif fng <= 80:
+            raw_mult = max(0.92, 1.0 - 0.004 * (fng - 60))
+        else:
+            raw_mult = 1.0 + 0.005 * (fng - 80)
+        age = time.time() - self._fng_ts
+        w = self._staleness_weight(age, self._FNG_FRESH, self._FNG_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
+
+
+_ext = _ExternalSignals()
 
 # Asset-specific 5-min sigma defaults (rough calibration from CRPS bounds)
 _DEFAULT_SIGMA_5M: Dict[str, float] = {
@@ -260,6 +363,12 @@ class MyTracker(TrackerBase):
         w_med  = 0.3
         w_slow = 0.5 - 0.5 * ri
         sigma_base = w_fast * fast_std + w_med * med_std + w_slow * slow_std
+
+        # ── External volatility signal ──
+        if asset in _STOCK_ASSETS:
+            sigma_base *= _ext.stock_vol_mult()
+        elif asset in _CRYPTO_ASSETS:
+            sigma_base *= _ext.crypto_vol_mult()
 
         # ── Adaptive GARCH ──
         gw = recent[-garch_win:] if len(recent) >= garch_win else recent
