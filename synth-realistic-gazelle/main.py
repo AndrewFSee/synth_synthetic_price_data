@@ -1,12 +1,12 @@
 """
-CrunchDAO Synth Competition -- Adaptive Multi-scale + Laplace (realistic-gazelle)
+CrunchDAO Synth Competition -- Momentum-Skewed Adaptive (realistic-gazelle)
 
-v25 — v24 + external volatility signals (VIX + Fear & Greed):
-  v24: per-asset calibrated params, step-adaptive sigma
-  v25: VIX (Yahoo Finance) for stocks, Fear & Greed (alternative.me) for crypto
-       Both cached, staleness decay toward neutral as data ages.
-       Evidence: fox (with signals) held rank 20 during Mar 14 dip while
-       gazelle (without) crashed to rank 55.
+v26 — Aggressive overhaul:
+  1. Student-t tails for crypto (fox's proven df params) instead of Laplace
+  2. Momentum-based drift: shift distribution loc by recent trend
+     → approximates skewed-t that top models use
+  3. External signals (VIX/FNG) from v25
+  4. Per-asset calibrated params from v24
 MAX 3 leaf components per density (framework limit).
 """
 
@@ -128,15 +128,16 @@ _DEFAULT_SIGMA_5M: Dict[str, float] = {
 }
 
 # ── Per-asset calibrated parameters ──────────────────────────────────────────
-# From v2 train/test calibration.  Gazelle uses lap_mult instead of df/tsm.
-# Keys: tail_w, lap_mult, ewma_lam, lookback
+# Crypto: Student-t params from fox (proven better than Laplace during dips).
+# Stocks: Keep Laplace (df>=20 Student-t ≈ Normal, wastes slot).
+# Keys: tail_w, tsm/lap_mult, df (crypto only), ewma_lam, lookback
 _CAL: Dict[str, Dict[str, float]] = {
-    # Crypto
-    "BTC":    {"tail_w": 0.20, "lap_mult": 1.2, "lam": 0.94, "lb": 250},
-    "ETH":    {"tail_w": 0.39, "lap_mult": 1.5, "lam": 0.94, "lb": 200},
-    "XAUT":   {"tail_w": 0.37, "lap_mult": 1.5, "lam": 0.94, "lb": 375},
-    "SOL":    {"tail_w": 0.34, "lap_mult": 1.4, "lam": 0.94, "lb": 225},
-    # Stocks — longer lookback, smoother EWMA
+    # Crypto — Student-t (fox's v20 proven params)
+    "BTC":    {"tail_w": 0.20, "tsm": 0.30, "df": 4.2, "lam": 0.88, "lb": 250},
+    "ETH":    {"tail_w": 0.39, "tsm": 0.50, "df": 3.0, "lam": 0.92, "lb": 200},
+    "XAUT":   {"tail_w": 0.34, "tsm": 0.50, "df": 6.8, "lam": 0.86, "lb":  50},
+    "SOL":    {"tail_w": 0.34, "tsm": 0.50, "df": 3.4, "lam": 0.92, "lb": 200},
+    # Stocks — Laplace tails
     "SPYX":   {"tail_w": 0.29, "lap_mult": 1.2, "lam": 0.95, "lb": 250},
     "NVDAX":  {"tail_w": 0.24, "lap_mult": 1.3, "lam": 0.93, "lb": 225},
     "TSLAX":  {"tail_w": 0.39, "lap_mult": 1.5, "lam": 0.94, "lb": 175},
@@ -147,7 +148,7 @@ _CAL_DEFAULT = {"tail_w": 0.30, "lap_mult": 1.4, "lam": 0.94, "lb": 200}
 
 
 class MyTracker(TrackerBase):
-    """Regime-aware tracker with Laplace tails.  ≤ 3 components always."""
+    """Momentum-skewed tracker: Student-t for crypto, Laplace for stocks.  ≤ 3 components always."""
 
     def __init__(self):
         super().__init__()
@@ -329,7 +330,27 @@ class MyTracker(TrackerBase):
             beta *= s
         omega = max(var * (1 - alpha - beta), 1e-6)
         return omega, alpha, beta
+    # ── momentum drift ─────────────────────────────────────────
 
+    def _momentum_drift(self, returns: np.ndarray, sigma: float) -> float:
+        """Estimate drift from recent momentum, clamped to avoid overconfidence.
+
+        Blends short-term (1h) and medium-term (6h) momentum signals.
+        Returns drift per 5-min bar, clamped to ±0.3×sigma.
+        """
+        n = len(returns)
+        # Short-term momentum: mean of last 12 bars (~1h)
+        short_mom = float(np.mean(returns[-min(12, n):]))
+        # Medium-term momentum: mean of last 72 bars (~6h)
+        med_mom = float(np.mean(returns[-min(72, n):]))
+        # Blend: weight short more when they agree in direction
+        if short_mom * med_mom > 0:  # same direction
+            drift = 0.6 * short_mom + 0.4 * med_mom
+        else:  # conflicting — reduce confidence
+            drift = 0.3 * short_mom + 0.2 * med_mom
+        # Clamp to ±30% of sigma to avoid overconfident directional bets
+        max_drift = 0.3 * sigma
+        return max(-max_drift, min(max_drift, drift))
     # ── main prediction ──────────────────────────────────────────────
 
     def predict(self, asset: str, horizon: int, step: int) -> List[Dict[str, Any]]:
@@ -349,7 +370,10 @@ class MyTracker(TrackerBase):
         # ── Per-asset calibrated parameters ──
         cal = _CAL.get(asset, _CAL_DEFAULT)
         tail_w_cal = cal["tail_w"]
-        lap_mult_base = cal["lap_mult"]
+        is_crypto = "df" in cal
+        df_cal = cal.get("df", 30.0)
+        tsm = cal.get("tsm", 0.5)
+        lap_mult_base = cal.get("lap_mult", 1.4)
         ewma_lam = cal["lam"]
         lookback = int(cal["lb"])
         garch_win = 72         # 6h
@@ -427,20 +451,32 @@ class MyTracker(TrackerBase):
             sigma = eff_blend * garch_sig + (1 - eff_blend) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
-            # Laplace scale: per-asset calibrated multiplier
-            lap_mult = lap_mult_base + 0.8 * ri
-            lap_scale = sigma * lap_mult
+            # ── Momentum drift (skewness approximation) ──
+            drift_per_bar = self._momentum_drift(recent, sigma_base)
+            drift = drift_per_bar * scale_factor
+
+            # ── Tail component: Student-t for crypto, Laplace for stocks ──
+            if is_crypto:
+                df = max(2.5, df_cal - 1.0 * ri)
+                t_scale = sigma * tsm
+                tail_comp = {"density": {"type": "builtin", "name": "t",
+                                          "params": {"df": df, "loc": drift, "scale": t_scale}},
+                              "weight": tail_w}
+            else:
+                lap_mult = lap_mult_base + 0.8 * ri
+                lap_scale = sigma * lap_mult
+                tail_comp = {"density": {"type": "builtin", "name": "laplace",
+                                          "params": {"loc": drift, "scale": lap_scale}},
+                              "weight": tail_w}
 
             if pre_base:
-                pre_loc = pre_base["loc"] * scale_factor
+                pre_loc = pre_base["loc"] * scale_factor + drift
                 pre_scale = max(pre_base["scale"] * sqrt_sf, 1e-6)
                 components = [
                     {"density": {"type": "builtin", "name": "norm",
-                                 "params": {"loc": 0.0, "scale": sigma}},
+                                 "params": {"loc": drift, "scale": sigma}},
                      "weight": core_w},
-                    {"density": {"type": "builtin", "name": "laplace",
-                                 "params": {"loc": 0.0, "scale": lap_scale}},
-                     "weight": tail_w},
+                    tail_comp,
                     {"density": {"type": "builtin", "name": "norm",
                                  "params": {"loc": pre_loc, "scale": pre_scale}},
                      "weight": pre_w},
@@ -448,11 +484,9 @@ class MyTracker(TrackerBase):
             else:
                 components = [
                     {"density": {"type": "builtin", "name": "norm",
-                                 "params": {"loc": 0.0, "scale": sigma}},
+                                 "params": {"loc": drift, "scale": sigma}},
                      "weight": core_w},
-                    {"density": {"type": "builtin", "name": "laplace",
-                                 "params": {"loc": 0.0, "scale": lap_scale}},
-                     "weight": tail_w},
+                    tail_comp,
                 ]
 
             distributions.append({
