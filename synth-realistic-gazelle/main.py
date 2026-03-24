@@ -1,20 +1,16 @@
 """
-CrunchDAO Synth Competition -- Momentum-Skewed Adaptive (realistic-gazelle)
+CrunchDAO Synth Competition -- Fox-architecture Adaptive (realistic-gazelle)
 
-v26 — Aggressive overhaul:
-  1. Student-t tails for crypto (fox's proven df params) instead of Laplace
-  2. Momentum-based drift: shift distribution loc by recent trend
-     → approximates skewed-t that top models use
-  3. External signals (VIX/FNG) from v25
-  4. Per-asset calibrated params from v24
+v30 — Enhanced external data signals:
+  v29: Fox-full architecture (-22% CRPS over 55 days vs v26)
+  v30: Add derivatives data (Deribit implied vol), leverage metrics (OKX funding),
+       and macro signals (10Y Treasury yield) for better sigma calibration.
 MAX 3 leaf components per density (framework limit).
 """
 
 import json
 import math
 import numpy as np
-import pickle
-import re
 import time
 import urllib.request
 from pathlib import Path
@@ -26,10 +22,18 @@ _STOCK_ASSETS = {"SPYX", "NVDAX", "TSLAX", "AAPLX", "GOOGLX"}
 _CRYPTO_ASSETS = {"BTC", "ETH", "SOL", "XAUT"}
 _VIX_BASELINE = 20.0
 _FNG_NEUTRAL = 50
+_TNX_BASELINE = 4.0     # long-term 10Y yield baseline
+
+# OKX perpetual swap instrument IDs for funding rate
+_OKX_FUNDING_MAP = {"BTC": "BTC-USDT-SWAP", "ETH": "ETH-USDT-SWAP", "SOL": "SOL-USDT-SWAP"}
 
 
 class _ExternalSignals:
-    """Cached VIX + Fear & Greed fetcher with staleness decay."""
+    """Multi-source signal fetcher with staleness decay.
+
+    Sources: VIX, Fear & Greed, Deribit DVOL (implied vol),
+    OKX funding rate (leverage), 10Y Treasury yield (macro).
+    """
 
     _VIX_TTL = 900
     _FNG_TTL = 3600
@@ -37,6 +41,18 @@ class _ExternalSignals:
     _VIX_STALE = 21600
     _FNG_FRESH = 21600
     _FNG_STALE = 86400
+    # Deribit DVOL
+    _DVOL_TTL = 900
+    _DVOL_FRESH = 3600
+    _DVOL_STALE = 21600
+    # OKX funding rate
+    _FUNDING_TTL = 1800
+    _FUNDING_FRESH = 7200
+    _FUNDING_STALE = 28800
+    # 10Y Treasury yield
+    _TNX_TTL = 3600
+    _TNX_FRESH = 3600
+    _TNX_STALE = 21600
 
     def __init__(self):
         self._vix: float = _VIX_BASELINE
@@ -45,6 +61,20 @@ class _ExternalSignals:
         self._fng: int = _FNG_NEUTRAL
         self._fng_ts: float = 0.0
         self._fng_fetch_ts: float = 0.0
+        # Deribit DVOL
+        self._btc_dvol: Optional[float] = None
+        self._eth_dvol: Optional[float] = None
+        self._dvol_ts: float = 0.0
+        self._dvol_fetch_ts: float = 0.0
+        # OKX funding rate
+        self._funding: Dict[str, float] = {}
+        self._funding_ts: float = 0.0
+        self._funding_fetch_ts: float = 0.0
+        # 10Y Treasury yield
+        self._tnx: float = _TNX_BASELINE
+        self._tnx_prev: float = _TNX_BASELINE
+        self._tnx_ts: float = 0.0
+        self._tnx_fetch_ts: float = 0.0
 
     @staticmethod
     def _get_json(url: str, timeout: int = 5) -> Any:
@@ -118,6 +148,117 @@ class _ExternalSignals:
         w = self._staleness_weight(age, self._FNG_FRESH, self._FNG_STALE)
         return 1.0 + w * (raw_mult - 1.0)
 
+    # ── Deribit DVOL (crypto implied volatility) ─────────────────────
+
+    def _refresh_dvol(self) -> None:
+        now = time.time()
+        if now - self._dvol_fetch_ts < self._DVOL_TTL:
+            return
+        self._dvol_fetch_ts = now
+        now_ms = int(now * 1000)
+        start_ms = now_ms - 7200000  # last 2h
+        for currency, attr in [("BTC", "_btc_dvol"), ("ETH", "_eth_dvol")]:
+            try:
+                data = self._get_json(
+                    "https://www.deribit.com/api/v2/public/"
+                    "get_volatility_index_data"
+                    f"?currency={currency}&resolution=3600"
+                    f"&start_timestamp={start_ms}&end_timestamp={now_ms}"
+                )
+                points = data.get("result", {}).get("data", [])
+                if points:
+                    val = float(points[-1][4])
+                    if 5.0 <= val <= 200.0:
+                        setattr(self, attr, val)
+                        self._dvol_ts = now
+            except Exception:
+                pass
+
+    def crypto_dvol_mult(self, asset: str, realized_annual_vol: float) -> float:
+        """Deribit implied vol vs realized vol → sigma multiplier."""
+        self._refresh_dvol()
+        dvol = self._eth_dvol if asset == "ETH" else self._btc_dvol
+        if dvol is None:
+            return 1.0
+        if realized_annual_vol < 5.0:
+            return 1.0
+        ratio = dvol / realized_annual_vol
+        raw_mult = max(0.85, min(1.20, math.sqrt(ratio)))
+        age = time.time() - self._dvol_ts
+        w = self._staleness_weight(age, self._DVOL_FRESH, self._DVOL_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
+
+    # ── OKX Funding Rate (crypto leverage) ───────────────────────
+
+    def _refresh_funding(self) -> None:
+        now = time.time()
+        if now - self._funding_fetch_ts < self._FUNDING_TTL:
+            return
+        self._funding_fetch_ts = now
+        for asset, inst_id in _OKX_FUNDING_MAP.items():
+            try:
+                data = self._get_json(
+                    "https://www.okx.com/api/v5/public/funding-rate"
+                    f"?instId={inst_id}"
+                )
+                if data.get("code") == "0":
+                    items = data.get("data", [])
+                    if items:
+                        rate = float(items[0].get("fundingRate", 0))
+                        self._funding[asset] = rate
+                        self._funding_ts = now
+            except Exception:
+                pass
+
+    def funding_tail_adj(self, asset: str) -> float:
+        """Extreme funding rate → wider tails (leverage risk)."""
+        self._refresh_funding()
+        rate = self._funding.get(asset)
+        if rate is None:
+            return 0.0
+        raw_adj = min(0.04, max(0.0, (abs(rate) - 0.0002) * 40))
+        age = time.time() - self._funding_ts
+        w = self._staleness_weight(age, self._FUNDING_FRESH, self._FUNDING_STALE)
+        return raw_adj * w
+
+    # ── 10Y Treasury Yield (macro signal for stocks) ───────────────
+
+    def _refresh_tnx(self) -> None:
+        now = time.time()
+        if now - self._tnx_fetch_ts < self._TNX_TTL:
+            return
+        self._tnx_fetch_ts = now
+        try:
+            data = self._get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/"
+                "%5ETNX?interval=1d&range=5d"
+            )
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice")
+            if price is not None and 0.5 <= float(price) <= 20.0:
+                self._tnx_prev = self._tnx if self._tnx_ts > 0 else float(price)
+                self._tnx = float(price)
+                self._tnx_ts = now
+        except Exception:
+            pass
+
+    def treasury_vol_mult(self) -> float:
+        """10Y yield change → stock vol multiplier."""
+        self._refresh_tnx()
+        if self._tnx_ts == 0:
+            return 1.0
+        change_bps = (self._tnx - self._tnx_prev) * 100
+        if abs(change_bps) < 3:
+            raw_mult = 1.0
+        elif change_bps > 0:
+            raw_mult = 1.0 + min(0.08, change_bps * 0.004)
+        else:
+            raw_mult = 1.0 + max(-0.05, change_bps * 0.0025)
+        raw_mult = max(0.93, min(1.10, raw_mult))
+        age = time.time() - self._tnx_ts
+        w = self._staleness_weight(age, self._TNX_FRESH, self._TNX_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
+
 
 _ext = _ExternalSignals()
 
@@ -128,142 +269,32 @@ _DEFAULT_SIGMA_5M: Dict[str, float] = {
 }
 
 # ── Per-asset calibrated parameters ──────────────────────────────────────────
-# Crypto: Student-t params from fox (proven better than Laplace during dips).
-# Stocks: Keep Laplace (df>=20 Student-t ≈ Normal, wastes slot).
-# Keys: tail_w, tsm/lap_mult, df (crypto only), ewma_lam, lookback
+# Fox v23 proven params.  All assets use tsm + df.
+# Stocks with df>=20 get Laplace tail (Student-t ≈ Normal at high df, wastes slot).
+# Keys: tail_w, tsm (t_scale_mult), df, ewma_lam, lookback
 _CAL: Dict[str, Dict[str, float]] = {
-    # Crypto — Student-t (fox's v20 proven params)
+    # Crypto
     "BTC":    {"tail_w": 0.20, "tsm": 0.30, "df": 4.2, "lam": 0.88, "lb": 250},
     "ETH":    {"tail_w": 0.39, "tsm": 0.50, "df": 3.0, "lam": 0.92, "lb": 200},
     "XAUT":   {"tail_w": 0.34, "tsm": 0.50, "df": 6.8, "lam": 0.86, "lb":  50},
     "SOL":    {"tail_w": 0.34, "tsm": 0.50, "df": 3.4, "lam": 0.92, "lb": 200},
-    # Stocks — Laplace tails
-    "SPYX":   {"tail_w": 0.29, "lap_mult": 1.2, "lam": 0.95, "lb": 250},
-    "NVDAX":  {"tail_w": 0.24, "lap_mult": 1.3, "lam": 0.93, "lb": 225},
-    "TSLAX":  {"tail_w": 0.39, "lap_mult": 1.5, "lam": 0.94, "lb": 175},
-    "AAPLX":  {"tail_w": 0.39, "lap_mult": 1.3, "lam": 0.95, "lb": 375},
-    "GOOGLX": {"tail_w": 0.39, "lap_mult": 1.2, "lam": 0.95, "lb": 175},
+    # Stocks
+    "SPYX":   {"tail_w": 0.29, "tsm": 0.30, "df": 16., "lam": 0.92, "lb": 250},
+    "NVDAX":  {"tail_w": 0.24, "tsm": 0.40, "df": 30., "lam": 0.86, "lb": 225},
+    "TSLAX":  {"tail_w": 0.39, "tsm": 0.60, "df": 30., "lam": 0.91, "lb": 175},
+    "AAPLX":  {"tail_w": 0.39, "tsm": 0.40, "df": 30., "lam": 0.90, "lb": 375},
+    "GOOGLX": {"tail_w": 0.39, "tsm": 0.30, "df": 30., "lam": 0.90, "lb": 175},
 }
-_CAL_DEFAULT = {"tail_w": 0.30, "lap_mult": 1.4, "lam": 0.94, "lb": 200}
+_CAL_DEFAULT = {"tail_w": 0.35, "tsm": 0.50, "df": 8.0, "lam": 0.90, "lb": 200}
 
 
 class MyTracker(TrackerBase):
-    """Momentum-skewed tracker: Student-t for crypto, Laplace for stocks.  ≤ 3 components always."""
+    """Fox-architecture adaptive tracker.  ≤ 3 components always."""
 
     def __init__(self):
         super().__init__()
-        self._quantile_models = None
-        self._feature_cols: List[str] = []
-        self._model_quantiles: List[float] = []
-        self._feature_index_cache: Dict[str, int] = {}
-        self._load_pretrained()
 
-    # ── pretrained quantile model helpers ─────────────────────────────
 
-    def _load_pretrained(self) -> None:
-        path = Path(__file__).resolve().parent / "resources" / "quantile_models.pkl"
-        if not path.exists():
-            return
-        try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
-            self._quantile_models = data.get("models")
-            self._feature_cols = list(data.get("feature_cols") or [])
-            self._model_quantiles = list(data.get("quantiles") or [])
-        except Exception:
-            self._quantile_models = None
-
-    def _feature_index_for_col(self, col: str) -> int:
-        cached = self._feature_index_cache.get(col)
-        if cached is not None:
-            return cached
-        # FIX: use \d+ (digit class), NOT \\d+ (literal backslash-d)
-        match = re.search(r"Feature_(\d+)", col)
-        idx = int(match.group(1)) if match else 1
-        self._feature_index_cache[col] = idx
-        return idx
-
-    def _base_features(self, returns: np.ndarray) -> List[float]:
-        arr = self._winsorize(returns)
-        feats: List[float] = []
-        mean = float(np.mean(arr))
-        std = float(np.std(arr)) + 1e-8
-        med = float(np.median(arr))
-        mad = float(np.median(np.abs(arr - med)))
-
-        feats.extend([
-            mean, std, med, mad,
-            float(np.min(arr)), float(np.max(arr)),
-            float(np.quantile(arr, 0.1)), float(np.quantile(arr, 0.25)),
-            float(np.quantile(arr, 0.75)), float(np.quantile(arr, 0.9)),
-            float(np.mean(np.abs(arr))), float(np.sqrt(np.mean(arr ** 2))),
-        ])
-        centered = arr - mean
-        feats.append(float(np.mean(centered ** 3) / (std ** 3)))  # skew
-        feats.append(float(np.mean(centered ** 4) / (std ** 4)))  # kurt
-
-        for w in [3, 6, 12, 24, 48, 96, 144, 192]:
-            chunk = arr[-w:] if len(arr) >= w else arr
-            cstd = float(np.std(chunk)) + 1e-8
-            feats.extend([
-                float(np.mean(chunk)), cstd, float(np.median(chunk)),
-                float(chunk[-1]), float(np.mean(np.abs(chunk))),
-                float(np.quantile(chunk, 0.1)), float(np.quantile(chunk, 0.9)),
-                float(cstd / std),
-            ])
-
-        abs_arr = np.abs(arr)
-        for w in [6, 12, 24, 48, 96]:
-            chunk = abs_arr[-w:] if len(abs_arr) >= w else abs_arr
-            feats.extend([
-                float(np.mean(chunk)), float(np.std(chunk)),
-                float(np.quantile(chunk, 0.5)),
-            ])
-
-        for lag in range(1, 33):
-            feats.append(self._safe_autocorr(arr, lag))
-
-        while len(feats) < 220:
-            idx = len(feats) + 1
-            feats.append(float(math.tanh(feats[-1]) + 0.0001 * idx))
-        return feats
-
-    def _vector_for_pretrained(self, returns: np.ndarray) -> np.ndarray:
-        base = self._base_features(returns)
-        n_base = len(base)
-        row = np.zeros(len(self._feature_cols), dtype=float)
-        for i, col in enumerate(self._feature_cols):
-            idx = self._feature_index_for_col(col)
-            row[i] = base[(idx - 1) % n_base]
-        return row.reshape(1, -1)
-
-    def _pretrained_base(self, returns: np.ndarray) -> Optional[Dict[str, float]]:
-        """Compute pretrained loc/scale at the BASE resolution (300 s)."""
-        if not self._quantile_models or not self._feature_cols:
-            return None
-        try:
-            x = self._vector_for_pretrained(returns)
-            locs, scales = [], []
-            for _, by_q in self._quantile_models.items():
-                if not isinstance(by_q, dict):
-                    continue
-                qp = {}
-                for q in self._model_quantiles:
-                    m = by_q.get(q)
-                    if m is not None:
-                        qp[float(q)] = float(m.predict(x)[0])
-                if 0.5 in qp and 0.9 in qp and 0.1 in qp:
-                    locs.append(qp[0.5])
-                    scales.append(max((qp[0.9] - qp[0.1]) / 2.563, 1e-6))
-            if not locs:
-                return None
-            loc = float(np.median(locs))
-            scale = float(np.median(scales))
-            if not (np.isfinite(loc) and np.isfinite(scale)):
-                return None
-            return {"loc": loc, "scale": max(scale, 1e-6)}
-        except Exception:
-            return None
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -281,11 +312,8 @@ class MyTracker(TrackerBase):
         c = float(np.corrcoef(x, y)[0, 1])
         return 0.0 if np.isnan(c) else c
 
-    def _ewma_var(self, returns: np.ndarray, lam: float = 0.97) -> float:
-        """EWMA variance — λ=0.97 gives effective memory of ~33 bars (~2.75h).
-
-        Smoother than fox (λ=0.94) for model diversity.
-        """
+    def _ewma_var(self, returns: np.ndarray, lam: float = 0.94) -> float:
+        """EWMA variance — λ=0.94 (fox-proven default)."""
         if len(returns) < 5:
             return float(np.var(returns)) + 1e-10
         seed_n = min(10, len(returns))
@@ -294,23 +322,21 @@ class MyTracker(TrackerBase):
             var = lam * var + (1 - lam) * r * r
         return max(var, 1e-10)
 
-    def _vol_regime(self, returns: np.ndarray) -> Tuple[float, float, float, float]:
-        """Three-scale regime detection (broader windows than fox for diversity).
+    def _vol_regime(self, returns: np.ndarray) -> Tuple[float, float, float]:
+        """Two-scale regime detection (fox architecture).
 
-        Returns (fast_std, med_std, slow_std, regime_intensity):
-            fast_std:  ~1.5h (18 bars)
-            med_std:   ~4h   (48 bars)
-            slow_std:  ~12h  (144 bars)
+        Returns (fast_std, slow_std, regime_intensity):
+            fast_std:  ~1h  (12 bars)
+            slow_std:  ~8h  (96 bars)
             regime_intensity: 0 = stable, 1 = extreme regime shift
         """
         n = len(returns)
-        fast_std = float(np.std(returns[-min(18, n):])) + 1e-10
-        med_std  = float(np.std(returns[-min(48, n):])) + 1e-10
-        slow_std = float(np.std(returns[-min(144, n):])) + 1e-10
+        fast_std = float(np.std(returns[-min(12, n):])) + 1e-10
+        slow_std = float(np.std(returns[-min(96, n):])) + 1e-10
         vol_ratio = fast_std / slow_std
         log_ratio = abs(math.log(max(vol_ratio, 0.01)))
         regime_intensity = min(1.0, log_ratio / math.log(3.0))
-        return fast_std, med_std, slow_std, regime_intensity
+        return fast_std, slow_std, regime_intensity
 
     def _estimate_garch_adaptive(self, returns: np.ndarray, regime_intensity: float):
         """GARCH(1,1) with adaptive alpha — reacts faster during regime changes."""
@@ -330,27 +356,6 @@ class MyTracker(TrackerBase):
             beta *= s
         omega = max(var * (1 - alpha - beta), 1e-6)
         return omega, alpha, beta
-    # ── momentum drift ─────────────────────────────────────────
-
-    def _momentum_drift(self, returns: np.ndarray, sigma: float) -> float:
-        """Estimate drift from recent momentum, clamped to avoid overconfidence.
-
-        Blends short-term (1h) and medium-term (6h) momentum signals.
-        Returns drift per 5-min bar, clamped to ±0.3×sigma.
-        """
-        n = len(returns)
-        # Short-term momentum: mean of last 12 bars (~1h)
-        short_mom = float(np.mean(returns[-min(12, n):]))
-        # Medium-term momentum: mean of last 72 bars (~6h)
-        med_mom = float(np.mean(returns[-min(72, n):]))
-        # Blend: weight short more when they agree in direction
-        if short_mom * med_mom > 0:  # same direction
-            drift = 0.6 * short_mom + 0.4 * med_mom
-        else:  # conflicting — reduce confidence
-            drift = 0.3 * short_mom + 0.2 * med_mom
-        # Clamp to ±30% of sigma to avoid overconfident directional bets
-        max_drift = 0.3 * sigma
-        return max(-max_drift, min(max_drift, drift))
     # ── main prediction ──────────────────────────────────────────────
 
     def predict(self, asset: str, horizon: int, step: int) -> List[Dict[str, Any]]:
@@ -370,64 +375,59 @@ class MyTracker(TrackerBase):
         # ── Per-asset calibrated parameters ──
         cal = _CAL.get(asset, _CAL_DEFAULT)
         tail_w_cal = cal["tail_w"]
-        is_crypto = "df" in cal
-        df_cal = cal.get("df", 30.0)
-        tsm = cal.get("tsm", 0.5)
-        lap_mult_base = cal.get("lap_mult", 1.4)
+        t_scale_mult = cal["tsm"]
+        df_cal = cal["df"]
         ewma_lam = cal["lam"]
         lookback = int(cal["lb"])
-        garch_win = 72         # 6h
 
         recent_raw = returns[-lookback:] if len(returns) >= lookback else returns
         recent = self._winsorize(recent_raw)
 
-        # ── Three-scale regime detection ──
-        fast_std, med_std, slow_std, ri = self._vol_regime(recent)
-        w_fast = 0.2 + 0.5 * ri
-        w_med  = 0.3
-        w_slow = 0.5 - 0.5 * ri
-        sigma_base = w_fast * fast_std + w_med * med_std + w_slow * slow_std
+        # ── Two-scale regime detection ──
+        fast_std, slow_std, ri = self._vol_regime(recent)
+        blend_fast = 0.3 + 0.5 * ri
+        sigma_base = blend_fast * fast_std + (1 - blend_fast) * slow_std
 
         # ── External volatility signal ──
         if asset in _STOCK_ASSETS:
             sigma_base *= _ext.stock_vol_mult()
+            sigma_base *= _ext.treasury_vol_mult()
         elif asset in _CRYPTO_ASSETS:
             sigma_base *= _ext.crypto_vol_mult()
+            # Deribit implied vol: forward-looking sigma correction
+            if asset in _OKX_FUNDING_MAP and last_price > 0 and slow_std > 1e-10:
+                realized_annual = (slow_std / last_price) * math.sqrt(288 * 365.25) * 100
+                sigma_base *= _ext.crypto_dvol_mult(asset, realized_annual)
 
-        # ── Adaptive GARCH ──
-        gw = recent[-garch_win:] if len(recent) >= garch_win else recent
-        omega, alpha, beta = self._estimate_garch_adaptive(gw, ri)
+        # ── EWMA variance with calibrated lambda ──
+        garch_win = min(48, len(recent))
+        gw = recent[-garch_win:]
         current_var = self._ewma_var(gw, lam=ewma_lam)
-        last_shock = float((recent[-1] - np.mean(recent[-18:])) ** 2)
+        omega, alpha, beta = self._estimate_garch_adaptive(gw, ri)
+        last_shock = float((recent[-1] - np.mean(recent[-12:])) ** 2)
 
-        # Clamps
+        # ── Sigma clamps ──
         if last_price > 0:
             min_scale = 0.0003 * last_price
             max_scale = 0.015 * last_price * (1 + 0.5 * ri)
         else:
             min_scale, max_scale = 1e-6, sigma_base * 8.0
 
-        # Pretrained: compute ONCE at base resolution
-        pre_base = self._pretrained_base(recent)
+        # ── Component weights ──
+        funding_adj = _ext.funding_tail_adj(asset) if asset in _OKX_FUNDING_MAP else 0.0
+        tail_w = min(0.50, tail_w_cal + 0.05 * ri + funding_adj)
+        tail_w = min(0.55, tail_w + 0.05)  # extra tail when no pretrained
+        core_w = 1.0 - tail_w
 
-        # ── Dynamic weights (per-asset calibrated) ──
-        tail_w = min(0.50, tail_w_cal + 0.10 * ri)
-        if pre_base:
-            pre_w  = max(0.05, 0.20 - 0.15 * ri)
-            core_w = max(0.10, 1.0 - tail_w - pre_w)
-            s = core_w + tail_w + pre_w
-            core_w, tail_w, pre_w = core_w / s, tail_w / s, pre_w / s
-        else:
-            tail_w = min(0.55, tail_w + 0.05)
-            core_w = 1.0 - tail_w
+        # ── df: small regime adjustment for crypto ──
+        df = max(2.5, df_cal - 1.0 * ri) if df_cal < 25 else df_cal
 
         scale_factor = step / resolution
         sqrt_sf = math.sqrt(max(scale_factor, 1e-6))
-        n_sub = max(1, int(scale_factor))
         num_segments = horizon // step
         distributions: List[Dict[str, Any]] = []
 
-        blend_fast = 0.3 + 0.5 * ri
+        n_sub = max(1, int(scale_factor))
 
         var_t = current_var
         for k in range(1, num_segments + 1):
@@ -444,50 +444,29 @@ class MyTracker(TrackerBase):
                 avg_var = var_t
 
             garch_sig = math.sqrt(max(avg_var * scale_factor, 1e-10))
-            # Step-adaptive: GARCH converges to unconditional var over many
-            # sub-steps.  Reduce GARCH weight for long steps.
             garch_decay = 1.0 / (1.0 + scale_factor / 48.0)
             eff_blend = blend_fast * garch_decay
             sigma = eff_blend * garch_sig + (1 - eff_blend) * (sigma_base * sqrt_sf)
             sigma = max(min_scale * sqrt_sf, min(max_scale * sqrt_sf, sigma))
 
-            # ── Momentum drift (skewness approximation) ──
-            drift_per_bar = self._momentum_drift(recent, sigma_base)
-            drift = drift_per_bar * scale_factor
+            t_scale = sigma * t_scale_mult
 
-            # ── Tail component: Student-t for crypto, Laplace for stocks ──
-            if is_crypto:
-                df = max(2.5, df_cal - 1.0 * ri)
-                t_scale = sigma * tsm
-                tail_comp = {"density": {"type": "builtin", "name": "t",
-                                          "params": {"df": df, "loc": drift, "scale": t_scale}},
-                              "weight": tail_w}
-            else:
-                lap_mult = lap_mult_base + 0.8 * ri
-                lap_scale = sigma * lap_mult
+            # Tail: Laplace for stocks (df>=20), Student-t for crypto
+            if df_cal >= 20:
                 tail_comp = {"density": {"type": "builtin", "name": "laplace",
-                                          "params": {"loc": drift, "scale": lap_scale}},
+                                          "params": {"loc": 0.0, "scale": t_scale}},
+                              "weight": tail_w}
+            else:
+                tail_comp = {"density": {"type": "builtin", "name": "t",
+                                          "params": {"df": df, "loc": 0.0, "scale": t_scale}},
                               "weight": tail_w}
 
-            if pre_base:
-                pre_loc = pre_base["loc"] * scale_factor + drift
-                pre_scale = max(pre_base["scale"] * sqrt_sf, 1e-6)
-                components = [
-                    {"density": {"type": "builtin", "name": "norm",
-                                 "params": {"loc": drift, "scale": sigma}},
-                     "weight": core_w},
-                    tail_comp,
-                    {"density": {"type": "builtin", "name": "norm",
-                                 "params": {"loc": pre_loc, "scale": pre_scale}},
-                     "weight": pre_w},
-                ]
-            else:
-                components = [
-                    {"density": {"type": "builtin", "name": "norm",
-                                 "params": {"loc": drift, "scale": sigma}},
-                     "weight": core_w},
-                    tail_comp,
-                ]
+            components = [
+                {"density": {"type": "builtin", "name": "norm",
+                             "params": {"loc": 0.0, "scale": sigma}},
+                 "weight": core_w},
+                tail_comp,
+            ]
 
             distributions.append({
                 "step": k * step,
