@@ -1,10 +1,11 @@
 """
 CrunchDAO Synth Competition -- GARCH + Adaptive Tails (invisible-fox)
 
-v22 — v21 improvements + external volatility signals:
-  v21: stock params from v2 calibration, Laplace tails, step-adaptive sigma
-  v22: VIX (Yahoo Finance) for stocks, Fear & Greed (alternative.me) for crypto
-       Both cached 1h, graceful fallback to neutral (1.0) on failure.
+v24 — Enhanced external data signals:
+  v23: Disable pretrained quantile model (28% CRPS improvement)
+  v24: Add derivatives data (Deribit implied vol), leverage metrics (OKX funding),
+       and macro signals (10Y Treasury yield) for better sigma calibration.
+       Implied vol is forward-looking vs backward-looking GARCH.
 MAX 3 leaf components per density (framework limit).
 """
 
@@ -24,33 +25,60 @@ _STOCK_ASSETS = {"SPYX", "NVDAX", "TSLAX", "AAPLX", "GOOGLX"}
 _CRYPTO_ASSETS = {"BTC", "ETH", "SOL", "XAUT"}
 _VIX_BASELINE = 20.0   # long-term average VIX
 _FNG_NEUTRAL = 50       # Fear & Greed neutral point
+_TNX_BASELINE = 4.0     # long-term 10Y yield baseline
+
+# OKX perpetual swap instrument IDs for funding rate
+_OKX_FUNDING_MAP = {"BTC": "BTC-USDT-SWAP", "ETH": "ETH-USDT-SWAP", "SOL": "SOL-USDT-SWAP"}
 
 
 class _ExternalSignals:
-    """Cached VIX + Fear & Greed fetcher with staleness decay.
+    """Multi-source signal fetcher with staleness decay.
 
-    Tokenized stocks trade 24/7 but VIX only updates during US market hours
-    (~6.5h/day).  Fear & Greed updates once daily.  To avoid applying a stale
-    signal as if it were fresh, multipliers decay toward 1.0 (neutral) as
-    the data ages:
-      - VIX:  full weight for 1h, linear decay to neutral over 6h
-      - F&G:  full weight for 6h, linear decay to neutral over 24h
+    Sources: VIX, Fear & Greed, Deribit DVOL (implied vol),
+    OKX funding rate (leverage), 10Y Treasury yield (macro).
+    All signals decay toward neutral as data ages.
     """
 
-    _VIX_TTL = 900      # re-fetch every 15 min (captures intraday moves)
-    _FNG_TTL = 3600      # re-fetch every 1h (only changes daily anyway)
+    _VIX_TTL = 900       # re-fetch every 15 min
+    _FNG_TTL = 3600      # re-fetch every 1h
     _VIX_FRESH = 3600    # full signal weight for 1h after fetch
     _VIX_STALE = 21600   # decays to neutral by 6h after fetch
     _FNG_FRESH = 21600   # full signal weight for 6h
     _FNG_STALE = 86400   # decays to neutral by 24h
+    # Deribit DVOL (crypto implied volatility)
+    _DVOL_TTL = 900      # re-fetch every 15 min
+    _DVOL_FRESH = 3600   # full weight for 1h
+    _DVOL_STALE = 21600  # decay to neutral by 6h
+    # OKX funding rate (crypto leverage)
+    _FUNDING_TTL = 1800  # re-fetch every 30 min
+    _FUNDING_FRESH = 7200   # full weight for 2h
+    _FUNDING_STALE = 28800  # decay by 8h (funding settles every 8h)
+    # 10Y Treasury yield (macro)
+    _TNX_TTL = 3600      # re-fetch every 1h
+    _TNX_FRESH = 3600
+    _TNX_STALE = 21600
 
     def __init__(self):
         self._vix: float = _VIX_BASELINE
-        self._vix_ts: float = 0.0          # last successful fetch time
-        self._vix_fetch_ts: float = 0.0    # last fetch attempt time
+        self._vix_ts: float = 0.0
+        self._vix_fetch_ts: float = 0.0
         self._fng: int = _FNG_NEUTRAL
         self._fng_ts: float = 0.0
         self._fng_fetch_ts: float = 0.0
+        # Deribit DVOL
+        self._btc_dvol: Optional[float] = None
+        self._eth_dvol: Optional[float] = None
+        self._dvol_ts: float = 0.0
+        self._dvol_fetch_ts: float = 0.0
+        # OKX funding rate
+        self._funding: Dict[str, float] = {}
+        self._funding_ts: float = 0.0
+        self._funding_fetch_ts: float = 0.0
+        # 10Y Treasury yield
+        self._tnx: float = _TNX_BASELINE
+        self._tnx_prev: float = _TNX_BASELINE
+        self._tnx_ts: float = 0.0
+        self._tnx_fetch_ts: float = 0.0
 
     @staticmethod
     def _get_json(url: str, timeout: int = 5) -> Any:
@@ -140,6 +168,128 @@ class _ExternalSignals:
         w = self._staleness_weight(age, self._FNG_FRESH, self._FNG_STALE)
         return 1.0 + w * (raw_mult - 1.0)
 
+    # ── Deribit DVOL (crypto implied volatility) ─────────────────────
+
+    def _refresh_dvol(self) -> None:
+        now = time.time()
+        if now - self._dvol_fetch_ts < self._DVOL_TTL:
+            return
+        self._dvol_fetch_ts = now
+        now_ms = int(now * 1000)
+        start_ms = now_ms - 7200000  # last 2h
+        for currency, attr in [("BTC", "_btc_dvol"), ("ETH", "_eth_dvol")]:
+            try:
+                data = self._get_json(
+                    "https://www.deribit.com/api/v2/public/"
+                    "get_volatility_index_data"
+                    f"?currency={currency}&resolution=3600"
+                    f"&start_timestamp={start_ms}&end_timestamp={now_ms}"
+                )
+                points = data.get("result", {}).get("data", [])
+                if points:
+                    val = float(points[-1][4])  # close of latest candle
+                    if 5.0 <= val <= 200.0:
+                        setattr(self, attr, val)
+                        self._dvol_ts = now
+            except Exception:
+                pass
+
+    def crypto_dvol_mult(self, asset: str, realized_annual_vol: float) -> float:
+        """Deribit implied vol vs realized vol → sigma multiplier.
+
+        If options market implies higher vol than GARCH estimates,
+        widen sigma (forward-looking adjustment).
+        """
+        self._refresh_dvol()
+        dvol = self._eth_dvol if asset == "ETH" else self._btc_dvol
+        if dvol is None:
+            return 1.0
+        if realized_annual_vol < 5.0:
+            return 1.0
+        ratio = dvol / realized_annual_vol
+        raw_mult = max(0.85, min(1.20, math.sqrt(ratio)))
+        age = time.time() - self._dvol_ts
+        w = self._staleness_weight(age, self._DVOL_FRESH, self._DVOL_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
+
+    # ── OKX Funding Rate (crypto leverage) ───────────────────────────
+
+    def _refresh_funding(self) -> None:
+        now = time.time()
+        if now - self._funding_fetch_ts < self._FUNDING_TTL:
+            return
+        self._funding_fetch_ts = now
+        for asset, inst_id in _OKX_FUNDING_MAP.items():
+            try:
+                data = self._get_json(
+                    "https://www.okx.com/api/v5/public/funding-rate"
+                    f"?instId={inst_id}"
+                )
+                if data.get("code") == "0":
+                    items = data.get("data", [])
+                    if items:
+                        rate = float(items[0].get("fundingRate", 0))
+                        self._funding[asset] = rate
+                        self._funding_ts = now
+            except Exception:
+                pass
+
+    def funding_tail_adj(self, asset: str) -> float:
+        """Extreme funding rate → wider tails (leverage risk).
+
+        |rate| > 0.0002 starts adding tail weight, max +0.04.
+        """
+        self._refresh_funding()
+        rate = self._funding.get(asset)
+        if rate is None:
+            return 0.0
+        raw_adj = min(0.04, max(0.0, (abs(rate) - 0.0002) * 40))
+        age = time.time() - self._funding_ts
+        w = self._staleness_weight(age, self._FUNDING_FRESH, self._FUNDING_STALE)
+        return raw_adj * w
+
+    # ── 10Y Treasury Yield (macro signal for stocks) ─────────────────
+
+    def _refresh_tnx(self) -> None:
+        now = time.time()
+        if now - self._tnx_fetch_ts < self._TNX_TTL:
+            return
+        self._tnx_fetch_ts = now
+        try:
+            data = self._get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/"
+                "%5ETNX?interval=1d&range=5d"
+            )
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice")
+            if price is not None and 0.5 <= float(price) <= 20.0:
+                self._tnx_prev = self._tnx if self._tnx_ts > 0 else float(price)
+                self._tnx = float(price)
+                self._tnx_ts = now
+        except Exception:
+            pass
+
+    def treasury_vol_mult(self) -> float:
+        """10Y yield change → stock vol multiplier.
+
+        Rapid yield increases (+20bps) → 1.08× vol (rate hikes disruptive).
+        Small moves (<3bps) → neutral.
+        """
+        self._refresh_tnx()
+        if self._tnx_ts == 0:
+            return 1.0
+        change_bps = (self._tnx - self._tnx_prev) * 100
+        if abs(change_bps) < 3:
+            raw_mult = 1.0
+        elif change_bps > 0:
+            raw_mult = 1.0 + min(0.08, change_bps * 0.004)
+        else:
+            raw_mult = 1.0 + max(-0.05, change_bps * 0.0025)
+        raw_mult = max(0.93, min(1.10, raw_mult))
+        age = time.time() - self._tnx_ts
+        w = self._staleness_weight(age, self._TNX_FRESH, self._TNX_STALE)
+        return 1.0 + w * (raw_mult - 1.0)
+
 
 _ext = _ExternalSignals()
 
@@ -178,7 +328,8 @@ class MyTracker(TrackerBase):
         self._feature_cols: List[str] = []
         self._model_quantiles: List[float] = []
         self._feature_index_cache: Dict[str, int] = {}
-        self._load_pretrained()
+        # v23: pretrained quantile model disabled (28% CRPS improvement)
+        # self._load_pretrained()
 
     # ── pretrained quantile model helpers ─────────────────────────────
 
@@ -392,8 +543,13 @@ class MyTracker(TrackerBase):
         # ── External vol signal ──
         if asset in _STOCK_ASSETS:
             sigma_base *= _ext.stock_vol_mult()
+            sigma_base *= _ext.treasury_vol_mult()
         elif asset in _CRYPTO_ASSETS:
             sigma_base *= _ext.crypto_vol_mult()
+            # Deribit implied vol: forward-looking sigma correction
+            if asset in _OKX_FUNDING_MAP and last_price > 0 and slow_std > 1e-10:
+                realized_annual = (slow_std / last_price) * math.sqrt(288 * 365.25) * 100
+                sigma_base *= _ext.crypto_dvol_mult(asset, realized_annual)
 
         # ── EWMA variance with calibrated lambda ──
         garch_win = min(48, len(recent))
@@ -414,7 +570,9 @@ class MyTracker(TrackerBase):
 
         # ── Component weights ──
         # Small ri adjustment: slightly more tail during regime changes
-        tail_w = min(0.50, tail_w_cal + 0.05 * ri)
+        # Funding rate: extreme leverage → wider tails
+        funding_adj = _ext.funding_tail_adj(asset) if asset in _OKX_FUNDING_MAP else 0.0
+        tail_w = min(0.50, tail_w_cal + 0.05 * ri + funding_adj)
 
         if pre_base:
             pre_w = max(0.05, 0.25 - 0.15 * ri)
