@@ -1,11 +1,14 @@
 """
 CrunchDAO Synth Competition -- GARCH + Adaptive Tails (invisible-fox)
 
-v24 — Enhanced external data signals:
-  v23: Disable pretrained quantile model (28% CRPS improvement)
+v25 — Time-of-day sigma adjustment for 24h profile:
   v24: Add derivatives data (Deribit implied vol), leverage metrics (OKX funding),
        and macro signals (10Y Treasury yield) for better sigma calibration.
-       Implied vol is forward-looking vs backward-looking GARCH.
+  v25: Per-segment sigma scaling based on intraday volatility seasonality.
+       Crypto vol varies 2-3× through the day (peak at US open 14-16 UTC).
+       For 24h predictions with >=12 segments spanning >=12h, adjust each
+       segment's scale by time-of-day multiplier (60% blend).
+       Also thin tails at step>=21600 (CLT at longer horizons).
 MAX 3 leaf components per density (framework limit).
 """
 
@@ -29,6 +32,16 @@ _TNX_BASELINE = 4.0     # long-term 10Y yield baseline
 
 # OKX perpetual swap instrument IDs for funding rate
 _OKX_FUNDING_MAP = {"BTC": "BTC-USDT-SWAP", "ETH": "ETH-USDT-SWAP", "SOL": "SOL-USDT-SWAP"}
+
+# ── Intraday volatility seasonality (smoothed 3-hour rolling avg) ────────────
+# Measured from 450 days of 5-min data.  Peak ~14-16 UTC (US open), trough ~10-12.
+_TOD_MULT = {
+    "BTC": {0: 0.996, 1: 0.996, 2: 0.933, 3: 0.829, 4: 0.773, 5: 0.741, 6: 0.755, 7: 0.757, 8: 0.786, 9: 0.757, 10: 0.737, 11: 0.700, 12: 0.803, 13: 1.081, 14: 1.350, 15: 1.456, 16: 1.359, 17: 1.250, 18: 1.171, 19: 1.098, 20: 0.976, 21: 0.920, 22: 0.961, 23: 0.975},
+    "ETH": {0: 0.983, 1: 0.983, 2: 0.941, 3: 0.837, 4: 0.774, 5: 0.742, 6: 0.775, 7: 0.749, 8: 0.773, 9: 0.745, 10: 0.691, 11: 0.687, 12: 0.791, 13: 1.069, 14: 1.314, 15: 1.422, 16: 1.334, 17: 1.305, 18: 1.224, 19: 1.032, 20: 0.981, 21: 0.959, 22: 0.958, 23: 0.972},
+    "SOL": {0: 1.120, 1: 1.120, 2: 0.957, 3: 0.837, 4: 0.781, 5: 0.764, 6: 0.771, 7: 0.794, 8: 0.801, 9: 0.749, 10: 0.708, 11: 0.693, 12: 0.784, 13: 1.020, 14: 1.259, 15: 1.377, 16: 1.317, 17: 1.255, 18: 1.172, 19: 1.020, 20: 0.957, 21: 0.955, 22: 0.946, 23: 1.108},
+    "XAUT": {0: 1.109, 1: 1.135, 2: 1.071, 3: 0.822, 4: 0.737, 5: 0.770, 6: 0.816, 7: 0.821, 8: 0.831, 9: 0.856, 10: 0.833, 11: 0.799, 12: 0.936, 13: 1.084, 14: 1.335, 15: 1.371, 16: 1.109, 17: 1.068, 18: 1.126, 19: 0.923, 20: 0.810, 21: 0.821, 22: 0.918, 23: 1.134},
+}
+_TOD_BLEND = 0.6  # blend factor: 0=no adjustment, 1=full adjustment
 
 
 class _ExternalSignals:
@@ -656,6 +669,33 @@ class MyTracker(TrackerBase):
                 "type": "mixture",
                 "components": components,
             })
+
+        # ── v25: Tail thinning at long steps (CLT → more Normal) ─────────
+        if step >= 21600:
+            tail_red = 0.7 if step < 86400 else 0.5
+            for d in distributions:
+                comps = d.get("components", [])
+                for c in comps:
+                    dn = c.get("density", {}).get("name", "")
+                    if dn in ("t", "laplace"):
+                        c["weight"] *= tail_red
+                tw = sum(c["weight"] for c in comps)
+                if tw > 0:
+                    for c in comps:
+                        c["weight"] /= tw
+
+        # ── v25: Time-of-day sigma for 24h-spanning predictions ──────────
+        tod = _TOD_MULT.get(asset)
+        if tod and num_segments >= 12 and num_segments * step >= 43200:
+            current_ts = float(pairs[-1][0])
+            for k, d in enumerate(distributions, 1):
+                seg_hour = int(((current_ts + k * step) % 86400) // 3600)
+                raw = tod.get(seg_hour, 1.0)
+                m = 1.0 + _TOD_BLEND * (raw - 1.0)
+                for c in d.get("components", []):
+                    p = c.get("density", {}).get("params", {})
+                    if "scale" in p:
+                        p["scale"] *= m
 
         return distributions
 
